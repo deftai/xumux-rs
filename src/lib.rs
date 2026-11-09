@@ -8,6 +8,8 @@ pub mod frame;
 pub mod pipe;
 #[cfg(feature = "quic")]
 pub mod quic;
+#[cfg(feature = "webtransport")]
+pub mod webtransport;
 mod session;
 pub mod transport;
 #[cfg(feature = "websocket")]
