@@ -97,6 +97,50 @@ impl Session {
         Ok((s, out))
     }
 
+    /// Runs the server side on a message pipe: one frame per message, no magic (WebSocket, WebRTC).
+    pub async fn accept_messages<R: MessageReader, W: MessageWriter>(reader: R, writer: W, opts: Options, acceptor: Acceptor) -> Result<Session> {
+        let core = Core::new(Role::Server, opts, acceptor.policy, acceptor.authorize, Instant::now())?;
+        let s = Session::spawn_messages(core, reader, writer);
+        s.finish_handshake().await?;
+        Ok(s)
+    }
+
+    /// Runs the client side on a message pipe.
+    pub async fn connect_messages<R: MessageReader, W: MessageWriter>(
+        reader: R,
+        writer: W,
+        opts: Options,
+        acceptor: Acceptor,
+        channels: Vec<ChannelSpec>,
+    ) -> Result<(Session, Vec<Result<Channel>>)> {
+        let now = Instant::now();
+        let mut core = Core::new(Role::Client, opts, acceptor.policy, acceptor.authorize, now)?;
+        let opened = core.start_client(&channels, now);
+        let waits: Vec<_> = opened
+            .iter()
+            .map(|(id, sig)| (*id, sig.clone(), core.hello_channel_waiter(*id).expect("just inserted")))
+            .collect();
+        let s = Session::spawn_messages(core, reader, writer);
+        s.finish_handshake().await?;
+        let mut out = Vec::with_capacity(waits.len());
+        for ((id, sig, rx), spec) in waits.into_iter().zip(channels) {
+            out.push(match rx.await {
+                Ok(Ok(_)) => Ok(Channel { session: s.clone(), id, sig, spec }),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(s.closed_error()),
+            });
+        }
+        Ok((s, out))
+    }
+
+    fn spawn_messages<R: MessageReader, W: MessageWriter>(core: Core, reader: R, writer: W) -> Session {
+        let shared = Arc::new(Shared { core: Mutex::new(core), wake_writer: Notify::new(), wake_timer: Notify::new(), closed: Notify::new() });
+        tokio::spawn(read_messages(shared.clone(), reader));
+        tokio::spawn(write_messages(shared.clone(), writer));
+        tokio::spawn(timer_loop(shared.clone()));
+        Session { shared }
+    }
+
     fn spawn<R, W>(core: Core, reader: R, writer: W) -> Session
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -326,6 +370,116 @@ async fn write_loop<W: AsyncWrite + Unpin>(shared: Arc<Shared>, mut w: W) {
             return;
         }
         waiting.await;
+    }
+}
+
+/// One message from a message pipe.
+pub enum Incoming {
+    Binary(Bytes),
+    /// Bindings carry frames in binary messages, so a text message is a protocol error.
+    Text,
+}
+
+/// The receive side of a message-oriented transport. `None` means it ended.
+pub trait MessageReader: Send + 'static {
+    fn read(&mut self) -> impl Future<Output = Option<Incoming>> + Send;
+}
+
+/// The send side of a message-oriented transport.
+pub trait MessageWriter: Send + 'static {
+    fn write(&mut self, message: Bytes) -> impl Future<Output = std::io::Result<()>> + Send;
+    /// Ends the transport, after the xumux CLOSE exchange.
+    fn close(&mut self) -> impl Future<Output = ()> + Send;
+}
+
+async fn read_messages<R: MessageReader>(shared: Arc<Shared>, mut r: R) {
+    while let Some(msg) = r.read().await {
+        let failure = match msg {
+            Incoming::Text => Some((code::PROTOCOL_ERROR, "text message on a binary binding")),
+            Incoming::Binary(mut b) if b.len() >= HEADER_LEN => {
+                let head: [u8; HEADER_LEN] = b[..HEADER_LEN].try_into().expect("length checked");
+                let Header { channel, ty, flags, len } = parse_header(&head);
+                if len > shared.lock().frame_limit(channel) {
+                    Some((code::MESSAGE_TOO_LARGE, "frame exceeds the receiver's limit"))
+                } else if b.len() != HEADER_LEN + len as usize {
+                    // Core §2.3 step 2.
+                    Some((code::INVALID_MESSAGE, "message length differs from the frame's"))
+                } else {
+                    let payload = b.split_off(HEADER_LEN);
+                    let done = {
+                        let mut core = shared.lock();
+                        core.on_frame(Frame { channel, ty, flags, payload }, Instant::now());
+                        core.is_done()
+                    };
+                    shared.wake_writer.notify_one();
+                    shared.wake_timer.notify_one();
+                    if done {
+                        shared.closed.notify_waiters();
+                        return;
+                    }
+                    None
+                }
+            }
+            Incoming::Binary(_) => Some((code::INVALID_MESSAGE, "message shorter than a frame header")),
+        };
+        if let Some((c, reason)) = failure {
+            shared.lock().fail(c, reason);
+            shared.wake_writer.notify_one();
+            shared.wake_timer.notify_one();
+        }
+    }
+    let mut core = shared.lock();
+    core.transport_closed();
+    drop(core);
+    shared.closed.notify_waiters();
+    shared.wake_writer.notify_one();
+}
+
+async fn write_messages<W: MessageWriter>(shared: Arc<Shared>, mut w: W) {
+    let mut completed = Vec::new();
+    loop {
+        let waiting = shared.wake_writer.notified();
+        tokio::pin!(waiting);
+        waiting.as_mut().enable();
+        let (frame, close_now, done) = {
+            let mut core = shared.lock();
+            let f = core.next_frame(&mut completed);
+            (f, core.close_written(), core.is_done())
+        };
+        let had_frame = frame.is_some();
+        if let Some(f) = frame {
+            let mut buf = BytesMut::with_capacity(f.encoded_len());
+            f.encode_into(&mut buf);
+            let failed = w.write(buf.freeze()).await.is_err();
+            for c in completed.drain(..) {
+                let _ = c.send(Ok(()));
+            }
+            if failed {
+                shared.lock().transport_closed();
+                shared.closed.notify_waiters();
+                return;
+            }
+        }
+        if close_now || done {
+            {
+                let mut core = shared.lock();
+                core.close_write_done(Instant::now());
+            }
+            shared.wake_timer.notify_one();
+            // The peer's CLOSE may still be on its way, so the transport stays up until it arrives
+            // or the wait for it runs out.
+            let waiting = shared.closed.notified();
+            tokio::pin!(waiting);
+            waiting.as_mut().enable();
+            if !shared.lock().is_done() {
+                waiting.await;
+            }
+            w.close().await;
+            return;
+        }
+        if !had_frame {
+            waiting.await;
+        }
     }
 }
 

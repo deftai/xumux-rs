@@ -8,7 +8,9 @@ pub mod frame;
 pub mod pipe;
 mod session;
 pub mod transport;
+#[cfg(feature = "websocket")]
+pub mod ws;
 
 pub use crate::core::{ChannelSpec, Limits, Message, Options, ProbeStats, Properties, Refusal};
 pub use crate::error::{CloseInfo, Error, Result};
-pub use crate::session::{Acceptor, Channel, Session};
+pub use crate::session::{Acceptor, Channel, Incoming, MessageReader, MessageWriter, Session};
