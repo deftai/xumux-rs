@@ -13,6 +13,7 @@ use crate::frame::{code, parse_header, Frame, Header, HEADER_LEN, MAGIC};
 struct Shared {
     core: Mutex<Core>,
     wake_writer: Notify,
+    wake_datagrams: Notify,
     wake_timer: Notify,
     closed: Notify,
 }
@@ -97,6 +98,45 @@ impl Session {
         Ok((s, out))
     }
 
+    /// Runs on a QUIC session stream, with datagrams. Used by [`crate::quic`].
+    #[cfg(feature = "quic")]
+    pub(crate) fn spawn_quic<R, W, D>(core: Core, reader: R, writer: W, datagrams: D) -> Session
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+        D: DatagramPath,
+    {
+        let shared = Arc::new(Shared { core: Mutex::new(core), wake_writer: Notify::new(), wake_datagrams: Notify::new(), wake_timer: Notify::new(), closed: Notify::new() });
+        tokio::spawn(read_loop(shared.clone(), reader, false));
+        tokio::spawn(write_loop(shared.clone(), writer, false));
+        tokio::spawn(timer_loop(shared.clone()));
+        tokio::spawn(read_datagrams(shared.clone(), datagrams.clone()));
+        tokio::spawn(write_datagrams(shared.clone(), datagrams));
+        Session { shared }
+    }
+
+    #[cfg(feature = "quic")]
+    pub(crate) async fn finish_handshake_pub(&self) -> Result<()> {
+        self.finish_handshake().await
+    }
+
+    #[cfg(feature = "quic")]
+    pub(crate) async fn channels_from_hello(
+        &self,
+        waits: Vec<(u16, Arc<Signals>, tokio::sync::oneshot::Receiver<Result<Properties>>)>,
+        channels: Vec<ChannelSpec>,
+    ) -> Vec<Result<Channel>> {
+        let mut out = Vec::with_capacity(waits.len());
+        for ((id, sig, rx), spec) in waits.into_iter().zip(channels) {
+            out.push(match rx.await {
+                Ok(Ok(_)) => Ok(Channel { session: self.clone(), id, sig, spec }),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(self.closed_error()),
+            });
+        }
+        out
+    }
+
     /// Runs the server side on a message pipe: one frame per message, no magic (WebSocket, WebRTC).
     pub async fn accept_messages<R: MessageReader, W: MessageWriter>(reader: R, writer: W, opts: Options, acceptor: Acceptor) -> Result<Session> {
         let core = Core::new(Role::Server, opts, acceptor.policy, acceptor.authorize, Instant::now())?;
@@ -134,7 +174,7 @@ impl Session {
     }
 
     fn spawn_messages<R: MessageReader, W: MessageWriter>(core: Core, reader: R, writer: W) -> Session {
-        let shared = Arc::new(Shared { core: Mutex::new(core), wake_writer: Notify::new(), wake_timer: Notify::new(), closed: Notify::new() });
+        let shared = Arc::new(Shared { core: Mutex::new(core), wake_writer: Notify::new(), wake_datagrams: Notify::new(), wake_timer: Notify::new(), closed: Notify::new() });
         tokio::spawn(read_messages(shared.clone(), reader));
         tokio::spawn(write_messages(shared.clone(), writer));
         tokio::spawn(timer_loop(shared.clone()));
@@ -146,9 +186,9 @@ impl Session {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let shared = Arc::new(Shared { core: Mutex::new(core), wake_writer: Notify::new(), wake_timer: Notify::new(), closed: Notify::new() });
-        tokio::spawn(read_loop(shared.clone(), reader));
-        tokio::spawn(write_loop(shared.clone(), writer));
+        let shared = Arc::new(Shared { core: Mutex::new(core), wake_writer: Notify::new(), wake_datagrams: Notify::new(), wake_timer: Notify::new(), closed: Notify::new() });
+        tokio::spawn(read_loop(shared.clone(), reader, true));
+        tokio::spawn(write_loop(shared.clone(), writer, true));
         tokio::spawn(timer_loop(shared.clone()));
         Session { shared }
     }
@@ -263,9 +303,9 @@ impl Session {
     }
 }
 
-async fn read_loop<R: AsyncRead + Unpin>(shared: Arc<Shared>, mut r: R) {
+async fn read_loop<R: AsyncRead + Unpin>(shared: Arc<Shared>, mut r: R, use_magic: bool) {
     let mut magic = [0u8; 4];
-    let ok = r.read_exact(&mut magic).await.is_ok() && magic == MAGIC;
+    let ok = !use_magic || (r.read_exact(&mut magic).await.is_ok() && magic == MAGIC);
     if !ok {
         // Core: on a mismatch, close the transport without sending anything.
         shared.lock().transport_closed();
@@ -320,8 +360,8 @@ async fn read_loop<R: AsyncRead + Unpin>(shared: Arc<Shared>, mut r: R) {
     shared.wake_writer.notify_one();
 }
 
-async fn write_loop<W: AsyncWrite + Unpin>(shared: Arc<Shared>, mut w: W) {
-    if w.write_all(&MAGIC).await.is_err() || w.flush().await.is_err() {
+async fn write_loop<W: AsyncWrite + Unpin>(shared: Arc<Shared>, mut w: W, use_magic: bool) {
+    if use_magic && (w.write_all(&MAGIC).await.is_err() || w.flush().await.is_err()) {
         shared.lock().transport_closed();
         shared.closed.notify_waiters();
         return;
@@ -483,6 +523,67 @@ async fn write_messages<W: MessageWriter>(shared: Arc<Shared>, mut w: W) {
     }
 }
 
+/// A transport's unreliable datagrams.
+#[cfg(feature = "quic")]
+pub trait DatagramPath: Clone + Send + Sync + 'static {
+    fn read(&self) -> impl Future<Output = Option<Bytes>> + Send;
+    /// Sends one datagram. Failing to is the same as loss.
+    fn write(&self, b: Bytes);
+    fn max_size(&self) -> Option<usize>;
+}
+
+#[cfg(feature = "quic")]
+async fn read_datagrams<D: DatagramPath>(shared: Arc<Shared>, d: D) {
+    while let Some(mut b) = d.read().await {
+        if b.len() < HEADER_LEN {
+            continue;
+        }
+        let head: [u8; HEADER_LEN] = b[..HEADER_LEN].try_into().expect("length checked");
+        let Header { channel, ty, flags, len } = parse_header(&head);
+        // A bad datagram is discarded, as a lost one would be.
+        if b.len() != HEADER_LEN + len as usize || len > shared.lock().frame_limit(channel) {
+            continue;
+        }
+        let payload = b.split_off(HEADER_LEN);
+        shared.lock().on_datagram(Frame { channel, ty, flags, payload }, Instant::now());
+        shared.wake_writer.notify_one();
+        shared.wake_datagrams.notify_one();
+    }
+}
+
+#[cfg(feature = "quic")]
+async fn write_datagrams<D: DatagramPath>(shared: Arc<Shared>, d: D) {
+    loop {
+        let waiting = shared.wake_datagrams.notified();
+        tokio::pin!(waiting);
+        waiting.as_mut().enable();
+        let frames: Vec<Frame> = {
+            let mut core = shared.lock();
+            core.set_max_datagram(d.max_size());
+            let mut v = Vec::new();
+            while let Some(f) = core.next_datagram() {
+                v.push(f);
+            }
+            if core.is_done() {
+                return;
+            }
+            v
+        };
+        for f in &frames {
+            let mut buf = BytesMut::with_capacity(f.encoded_len());
+            f.encode_into(&mut buf);
+            d.write(buf.freeze());
+        }
+        if frames.is_empty() {
+            let closed = shared.closed.notified();
+            tokio::select! {
+                _ = waiting => {}
+                _ = closed => {}
+            }
+        }
+    }
+}
+
 async fn timer_loop(shared: Arc<Shared>) {
     loop {
         let wait = {
@@ -540,6 +641,7 @@ impl Channel {
 
     fn wake(&self) {
         self.session.shared.wake_writer.notify_one();
+        self.session.shared.wake_datagrams.notify_one();
     }
 
     /// Sends one message, fragmenting as needed. Resolves once it is handed to the transport. Waits
@@ -561,6 +663,11 @@ impl Channel {
     /// Bytes that can go out now, not counting what is already queued.
     pub fn send_credit(&self) -> Result<u64> {
         self.core().send_credit(self.id, &self.sig)
+    }
+
+    /// On a datagram channel, the largest message that can be sent. It can change as the path does.
+    pub fn max_datagram_payload(&self) -> Option<usize> {
+        self.core().max_datagram_payload(self.id, &self.sig)
     }
 
     /// The largest message that goes out as a single frame, for protocols that forbid fragments.

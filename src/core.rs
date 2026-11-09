@@ -17,6 +17,8 @@ use crate::frame::{code, ctl, Frame, CONTROL_MAX, MORE, PING, PONG, PROBE, RESER
 pub const PROTOCOL_VERSION: [u64; 3] = [0, 3, 0];
 const MAX_CREDIT: u64 = (1 << 31) - 1;
 const WINDOW_ENTRIES_PER_FRAME: usize = (CONTROL_MAX as usize) / 6;
+pub const QUIC_MULTISTREAM: &str = "quic-multistream/1";
+const DATAGRAM_QUARANTINE: Duration = Duration::from_secs(2);
 
 /// What a receiver declares: core §3.4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +61,8 @@ pub struct Options {
     /// Most bytes handed to the transport at once. Smaller lets a high-priority channel overtake
     /// sooner; larger costs fewer system calls.
     pub write_batch: usize,
+    /// Largest datagram the binding can send, where it has them. Set by the binding.
+    pub max_datagram: Option<usize>,
     pub application: Option<String>,
     pub auth: Option<Value>,
     pub extensions: Vec<String>,
@@ -78,6 +82,7 @@ impl Default for Options {
             connection_window: 64 << 20,
             max_control_queue: 1 << 20,
             write_batch: 64 * 1024,
+            max_datagram: None,
             application: None,
             auth: None,
             extensions: Vec::new(),
@@ -94,6 +99,8 @@ pub struct ChannelSpec {
     pub max_retransmits: Option<u64>,
     pub max_packet_life_time: Option<u64>,
     pub metadata: Option<Map<String, Value>>,
+    /// The path asked for under quic-multistream/1: `stream` or `datagram`.
+    pub quic: Option<String>,
 }
 
 impl ChannelSpec {
@@ -105,7 +112,14 @@ impl ChannelSpec {
             max_retransmits: None,
             max_packet_life_time: None,
             metadata: None,
+            quic: None,
         }
+    }
+
+    /// Latest value wins: unreliable and unordered, on QUIC datagrams where available. Elsewhere the
+    /// channel still opens, on the base path: check [`crate::Channel::properties`].
+    pub fn datagram(name: impl Into<String>) -> Self {
+        ChannelSpec { reliable: false, ordered: false, max_retransmits: Some(0), quic: Some("datagram".into()), ..Self::reliable(name) }
     }
 
     pub fn profile(mut self, profile: &str) -> Self {
@@ -128,6 +142,9 @@ impl ChannelSpec {
         }
         if let Some(m) = &self.metadata {
             o["metadata"] = Value::Object(m.clone());
+        }
+        if let Some(q) = &self.quic {
+            o["quic"] = json!(q);
         }
         o
     }
@@ -238,6 +255,10 @@ struct Chan {
     sent_close: bool,
     recv_close: bool,
     props: Properties,
+    /// On QUIC datagrams, not the base path.
+    datagram: bool,
+    /// What overtook the answer to our OPEN_CHANNEL (core §5.2).
+    held: Vec<Frame>,
     priority: u8,
     send_credit: u64,
     outq: VecDeque<OutMsg>,
@@ -304,6 +325,11 @@ pub struct Core {
     /// The peer sent CLOSE first, so writing our reply ends the connection.
     peer_closed: bool,
     started: Instant,
+    multistream: bool,
+    dgram_out: VecDeque<Frame>,
+    dgram_bytes: usize,
+    /// IDs of closed datagram channels, and when they may be used again.
+    quarantine: HashMap<u16, Instant>,
     pub(crate) accepted: VecDeque<Accepted>,
     pub(crate) welcome: Option<Map<String, Value>>,
     pub(crate) hello: Option<Map<String, Value>>,
@@ -373,6 +399,7 @@ fn parse_spec(o: &Map<String, Value>) -> std::result::Result<(u64, ChannelSpec),
             Some(Value::Object(m)) => Some(m.clone()),
             _ => return Err(Refusal::new(code::INVALID_MESSAGE, "metadata must be an object")),
         },
+        quic: opt_str(o, "quic")?,
     };
     Ok((id, spec))
 }
@@ -428,6 +455,10 @@ impl Core {
             close_frame_taken: false,
             peer_closed: false,
             started: now,
+            multistream: false,
+            dgram_out: VecDeque::new(),
+            dgram_bytes: 0,
+            quarantine: HashMap::new(),
             accepted: VecDeque::new(),
             welcome: None,
             hello: None,
@@ -721,6 +752,8 @@ impl Core {
         }
         self.remote = remote;
         self.hello = Some(o);
+        let accepted_ext: Vec<String> = extensions.into_iter().filter(|e| self.opts.extensions.contains(e)).collect();
+        self.multistream = accepted_ext.iter().any(|e| e == QUIC_MULTISTREAM) && self.opts.max_datagram.is_some();
 
         let mut accepted = Vec::new();
         let mut rejected = Vec::new();
@@ -734,19 +767,16 @@ impl Core {
                 Ok(()) => {
                     count += 1;
                     let sig = self.insert_channel(id, ChanState::Open, now);
-                    let props = self.channels[&id].props;
-                    accepted.push(json!({ "id": id, "reliable": props.reliable, "ordered": props.ordered }));
+                    accepted.push(self.accept_path(id, &spec));
                     self.accepted.push_back(Accepted { id, spec, sig });
                 }
                 Err(r) => rejected.push(json!({ "id": id, "code": r.code, "reason": r.reason })),
             }
         }
-        // No extensions are implemented yet, so WELCOME accepts none of the client's.
-        let _ = extensions;
         let l = self.opts.limits;
         let welcome = json!({
             "version": PROTOCOL_VERSION,
-            "extensions": [],
+            "extensions": accepted_ext.iter().filter(|e| *e != QUIC_MULTISTREAM || self.multistream).collect::<Vec<_>>(),
             "maxFramePayload": l.max_frame_payload,
             "maxMessageSize": l.max_message_size,
             "initialWindow": l.initial_window,
@@ -782,6 +812,7 @@ impl Core {
             return Err(Refusal::new(code::VERSION_MISMATCH, "unsupported version"));
         }
         self.remote = limits_from(&o)?;
+        self.multistream = o.get("extensions").and_then(Value::as_array).is_some_and(|a| a.iter().any(|e| e == QUIC_MULTISTREAM));
         if let Some(v) = opt_int(&o, "pingInterval")? {
             self.ping_interval = v;
         }
@@ -804,8 +835,10 @@ impl Core {
                     return Err(Refusal::new(code::PROTOCOL_ERROR, "WELCOME lists an ID that was not in HELLO"));
                 };
                 answered.insert(id16);
+                let datagram = opt_str(co, "quic")?.as_deref() == Some("datagram");
                 let ch = self.channels.get_mut(&id16).expect("present");
                 ch.props = Properties { reliable, ordered };
+                ch.datagram = datagram;
                 ch.state = ChanState::Open;
                 ch.send_credit = init;
                 if let Some(w) = ch.open_waiter.take() {
@@ -842,6 +875,26 @@ impl Core {
         Ok(())
     }
 
+    /// Chooses a new channel's path, and returns the body of its CHANNEL_ACK or WELCOME entry.
+    /// Dedicated streams aren't implemented: the draft lets a responder place those on the session
+    /// stream instead, and say so.
+    fn accept_path(&mut self, id: u16, spec: &ChannelSpec) -> Value {
+        let multistream = self.multistream;
+        let ch = self.channels.get_mut(&id).expect("just inserted");
+        let datagram = multistream && spec.quic.as_deref() == Some("datagram") && !spec.reliable;
+        if datagram {
+            ch.datagram = true;
+            ch.props = Properties { reliable: false, ordered: false };
+            return json!({ "id": id, "reliable": false, "ordered": false, "maxRetransmits": 0, "quic": "datagram" });
+        }
+        let props = ch.props;
+        let mut body = json!({ "id": id, "reliable": props.reliable, "ordered": props.ordered });
+        if multistream && spec.quic.is_some() {
+            body["quic"] = json!("session");
+        }
+        body
+    }
+
     fn decide(&self, spec: &ChannelSpec) -> std::result::Result<(), Refusal> {
         match &self.policy {
             Some(p) => p(spec),
@@ -861,6 +914,8 @@ impl Core {
                 recv_close: false,
                 // Only a base path exists: every channel is effectively reliable and ordered.
                 props: Properties { reliable: true, ordered: true },
+                datagram: false,
+                held: Vec::new(),
                 priority: 128,
                 send_credit: if self.phase == Phase::Open { u64::from(self.remote.initial_window) } else { 0 },
                 outq: VecDeque::new(),
@@ -887,6 +942,22 @@ impl Core {
 
     /// One received frame, after framing has applied core §2.3 steps 1-2.
     pub fn on_frame(&mut self, f: Frame, now: Instant) {
+        self.on_frame_via(f, now, false);
+    }
+
+    /// One frame from a datagram. A datagram for channel 0, or before the handshake, is discarded.
+    pub fn on_datagram(&mut self, f: Frame, now: Instant) {
+        if f.channel == 0 {
+            return;
+        }
+        if self.phase != Phase::Open {
+            self.last_recv = now;
+            return;
+        }
+        self.on_frame_via(f, now, true);
+    }
+
+    fn on_frame_via(&mut self, f: Frame, now: Instant, via_datagram: bool) {
         self.last_recv = now;
         self.keepalive_sent = None;
         if self.phase == Phase::Done {
@@ -913,6 +984,20 @@ impl Core {
         }
         if self.phase == Phase::Handshake {
             self.on_handshake_frame(f, now);
+            return;
+        }
+        // A channel uses exactly one path (core §1.2).
+        if let Some(ch) = self.channels.get_mut(&f.channel) {
+            if via_datagram && ch.state == ChanState::Opening {
+                if ch.held.len() < 64 {
+                    ch.held.push(f);
+                }
+                return;
+            }
+            if ch.datagram != via_datagram {
+                return;
+            }
+        } else if via_datagram {
             return;
         }
         if f.flags & PROBE != 0 {
@@ -959,7 +1044,7 @@ impl Core {
             }
         }
         if f.ty == PING {
-            self.probes_out.push_back(Frame::new(f.channel, PONG, PROBE, f.payload));
+            self.push_probe(Frame::new(f.channel, PONG, PROBE, f.payload));
             return;
         }
         let token = u32::from_be_bytes([f.payload[0], f.payload[1], f.payload[2], f.payload[3]]);
@@ -982,11 +1067,45 @@ impl Core {
         }
     }
 
+    /// A probe travels on its channel's path.
+    fn push_probe(&mut self, f: Frame) {
+        if self.channels.get(&f.channel).is_some_and(|c| c.datagram) {
+            self.push_datagram(f);
+        } else {
+            self.probes_out.push_back(f);
+        }
+    }
+
+    /// Unreliable data isn't flow-controlled, so its queue is bounded by dropping the oldest (core §4.2).
+    fn push_datagram(&mut self, f: Frame) {
+        self.dgram_bytes += f.encoded_len();
+        self.dgram_out.push_back(f);
+        while self.dgram_bytes > self.opts.max_control_queue {
+            let Some(old) = self.dgram_out.pop_front() else { break };
+            self.dgram_bytes -= old.encoded_len();
+        }
+    }
+
+    /// The next frame to send as a datagram.
+    pub fn next_datagram(&mut self) -> Option<Frame> {
+        if self.phase != Phase::Open {
+            return None;
+        }
+        let f = self.dgram_out.pop_front()?;
+        self.dgram_bytes -= f.encoded_len();
+        Some(f)
+    }
+
+    /// The path's limit can change as the network does.
+    pub fn set_max_datagram(&mut self, max: Option<usize>) {
+        self.opts.max_datagram = max;
+    }
+
     fn on_control(&mut self, f: Frame, now: Instant) {
         let r = match f.ty {
             ctl::HELLO | ctl::WELCOME => Err(Refusal::new(code::PROTOCOL_ERROR, "a second HELLO or WELCOME")),
             ctl::OPEN_CHANNEL => self.on_open_channel(&f.payload, now),
-            ctl::CHANNEL_ACK => self.on_channel_ack(&f.payload),
+            ctl::CHANNEL_ACK => self.on_channel_ack(&f.payload, now),
             ctl::CHANNEL_REJECT => self.on_channel_reject(&f.payload),
             ctl::CLOSE_CHANNEL => self.on_close_channel(&f.payload),
             ctl::WINDOW_UPDATE => self.on_window_update(&f.payload),
@@ -1035,8 +1154,8 @@ impl Core {
         match self.decide(&spec) {
             Ok(()) => {
                 let sig = self.insert_channel(id, ChanState::Open, now);
-                let props = self.channels[&id].props;
-                self.queue_ctrl(ctl::CHANNEL_ACK, &json!({ "id": id, "reliable": props.reliable, "ordered": props.ordered }));
+                let ack = self.accept_path(id, &spec);
+                self.queue_ctrl(ctl::CHANNEL_ACK, &ack);
                 self.accepted.push_back(Accepted { id, spec, sig });
                 self.wake_accept.notify_waiters();
             }
@@ -1052,17 +1171,23 @@ impl Core {
         id16.ok_or_else(|| Refusal::new(code::PROTOCOL_ERROR, "answer for a channel that is not opening"))
     }
 
-    fn on_channel_ack(&mut self, payload: &[u8]) -> std::result::Result<(), Refusal> {
+    fn on_channel_ack(&mut self, payload: &[u8], now: Instant) -> std::result::Result<(), Refusal> {
         let o = parse_object(payload)?;
         let id = self.opening_channel(int_field(&o, "id")?)?;
         let props = Properties { reliable: bool_field(&o, "reliable")?, ordered: bool_field(&o, "ordered")? };
         let init = u64::from(self.remote.initial_window);
+        let datagram = opt_str(&o, "quic")?.as_deref() == Some("datagram");
         let ch = self.channels.get_mut(&id).expect("present");
         ch.props = props;
+        ch.datagram = datagram;
         ch.state = ChanState::Open;
         ch.send_credit = init;
         if let Some(w) = ch.open_waiter.take() {
             let _ = w.send(Ok(props));
+        }
+        // Frames that overtook this answer can be processed now.
+        for f in std::mem::take(&mut ch.held) {
+            self.on_frame_via(f, now, datagram);
         }
         Ok(())
     }
@@ -1339,6 +1464,10 @@ impl Core {
         }
         let mut ch = self.channels.remove(&id).expect("present");
         self.total_window -= ch.window;
+        if ch.datagram {
+            // A delayed datagram carries nothing but the ID, so it could reach a later channel.
+            self.quarantine.insert(id, Instant::now() + DATAGRAM_QUARANTINE);
+        }
         let info = ch.close_info.clone().unwrap_or(CloseInfo { code: code::NORMAL, reason: String::new() });
         *ch.sig.finished.lock().unwrap() = Some(Finished { recv: std::mem::take(&mut ch.recv), info, stats: ch.stats });
         ch.sig.recv.notify_waiters();
@@ -1416,10 +1545,11 @@ impl Core {
             return Err(self.closed_error());
         }
         let start: u32 = if self.role == Role::Client { 1 } else { 2 };
+        self.quarantine.retain(|_, until| *until > now);
         let id = (start..u32::from(RESERVED_CHANNEL))
             .step_by(2)
             .map(|i| i as u16)
-            .find(|i| !self.channels.contains_key(i))
+            .find(|i| !self.channels.contains_key(i) && !self.quarantine.contains_key(i))
             .ok_or(Error::Invalid("no free channel IDs"))?;
         let body = spec.to_json(id);
         let _ = spec;
@@ -1463,11 +1593,21 @@ impl Core {
         if let Some(e) = err {
             return Err(e);
         }
+        let max_datagram = self.opts.max_datagram;
         let ch = self.channels.get_mut(&id).expect("checked");
         if !(ch.props.reliable && ch.props.ordered) && payload.len() > frame_limit {
             return Err(Error::TooLarge { size: payload.len(), limit: frame_limit });
         }
         let (tx, rx) = oneshot::channel();
+        if ch.datagram {
+            let limit = max_datagram.unwrap_or(0).saturating_sub(crate::frame::HEADER_LEN).min(frame_limit);
+            if payload.len() > limit {
+                return Err(Error::TooLarge { size: payload.len(), limit });
+            }
+            self.push_datagram(Frame::new(id, ty, 0, payload));
+            let _ = tx.send(Ok(()));
+            return Ok(rx);
+        }
         let key = (ch.priority, id);
         ch.outq.push_back(OutMsg { ty, payload, sent_any: false, done: Some(tx) });
         self.sendable.insert(key);
@@ -1486,13 +1626,28 @@ impl Core {
         if let Some(e) = self.channel_error_if_closed(id, sig) {
             return Err(e);
         }
-        let queued: u64 = self.channels[&id].outq.iter().map(|m| m.payload.len() as u64).sum();
-        Ok(self.channels[&id].send_credit.saturating_sub(queued))
+        let ch = &self.channels[&id];
+        if !ch.props.reliable {
+            return Ok(u64::MAX); // Not flow-controlled.
+        }
+        let queued: u64 = ch.outq.iter().map(|m| m.payload.len() as u64).sum();
+        Ok(ch.send_credit.saturating_sub(queued))
     }
 
     /// The largest message that goes out as a single frame.
     pub(crate) fn max_unfragmented(&self) -> u32 {
         self.opts.fragment_size.max(1).min(self.remote.max_frame_payload)
+    }
+
+    /// The largest payload this channel can send at all, in one frame, on a datagram path.
+    pub(crate) fn max_datagram_payload(&mut self, id: u16, sig: &Arc<Signals>) -> Option<usize> {
+        let limit = self.remote.max_frame_payload as usize;
+        let max = self.opts.max_datagram;
+        let ch = self.live(id, sig)?;
+        if !ch.datagram {
+            return None;
+        }
+        Some(max.unwrap_or(0).saturating_sub(crate::frame::HEADER_LEN).min(limit))
     }
 
     pub(crate) fn queued_messages(&mut self, id: u16, sig: &Arc<Signals>) -> usize {
@@ -1559,7 +1714,7 @@ impl Core {
         let max_window = self.opts.max_channel_window;
         let total = self.total_window;
         let Some(ch) = self.channels.get_mut(&id) else { return };
-        if ch.sent_close {
+        if ch.sent_close || !ch.props.reliable {
             return;
         }
         ch.unreturned += n;
@@ -1600,7 +1755,7 @@ impl Core {
             ch.stats.probes_sent += 1;
             let token = self.new_token(now);
             self.pings.insert(token, PendingPing { channel: id, sig: None, sent: now, waiter: None });
-            self.probes_out.push_back(Frame::new(id, PING, PROBE, Bytes::copy_from_slice(&token.to_be_bytes())));
+            self.push_probe(Frame::new(id, PING, PROBE, Bytes::copy_from_slice(&token.to_be_bytes())));
         }
     }
 
@@ -1624,7 +1779,7 @@ impl Core {
         let token = self.new_token(now);
         let (tx, rx) = oneshot::channel();
         self.pings.insert(token, PendingPing { channel: ch_id, sig: None, sent: now, waiter: Some(tx) });
-        self.probes_out.push_back(Frame::new(ch_id, PING, PROBE, Bytes::copy_from_slice(&token.to_be_bytes())));
+        self.push_probe(Frame::new(ch_id, PING, PROBE, Bytes::copy_from_slice(&token.to_be_bytes())));
         Ok(rx)
     }
 
@@ -1675,5 +1830,134 @@ impl Core {
 
     pub(crate) fn is_ended(&self) -> bool {
         self.phase != Phase::Open && self.phase != Phase::Handshake
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    fn server(datagrams: bool) -> Core {
+        let policy: Policy = Arc::new(|_| Ok(()));
+        let opts = Options { extensions: vec![QUIC_MULTISTREAM.into()], max_datagram: datagrams.then_some(1200), ..Options::default() };
+        Core::new(Role::Server, opts, Some(policy), None, Instant::now()).unwrap()
+    }
+
+    fn drain(c: &mut Core) -> Vec<Frame> {
+        let (mut out, mut done) = (Vec::new(), Vec::new());
+        while let Some(f) = c.next_frame(&mut done) {
+            out.push(f);
+        }
+        out
+    }
+
+    fn hello(c: &mut Core, ext: &str) -> Value {
+        let body = json!({ "version": PROTOCOL_VERSION, "extensions": [ext] });
+        c.on_frame(Frame::new(0, ctl::HELLO, 0, serde_json::to_vec(&body).unwrap()), Instant::now());
+        serde_json::from_slice(&drain(c)[0].payload).unwrap()
+    }
+
+    fn open(c: &mut Core, id: u16, quic: &str) -> Value {
+        let body = json!({ "id": id, "name": "x", "reliable": false, "ordered": false, "quic": quic });
+        c.on_frame(Frame::new(0, ctl::OPEN_CHANNEL, 0, serde_json::to_vec(&body).unwrap()), Instant::now());
+        serde_json::from_slice(&drain(c)[0].payload).unwrap()
+    }
+
+    fn close_code(frames: &[Frame]) -> Option<u64> {
+        frames.iter().find(|f| f.channel == 0 && f.ty == ctl::CLOSE).map(|f| serde_json::from_slice::<Value>(&f.payload).unwrap()["code"].as_u64().unwrap())
+    }
+
+    #[test]
+    fn the_extension_needs_datagrams_and_both_sides() {
+        let mut c = server(true);
+        assert_eq!(hello(&mut c, QUIC_MULTISTREAM)["extensions"], json!([QUIC_MULTISTREAM]));
+        let mut c = server(false);
+        assert_eq!(hello(&mut c, QUIC_MULTISTREAM)["extensions"], json!([]));
+        let mut c = server(true);
+        assert_eq!(hello(&mut c, "something/1")["extensions"], json!([]));
+    }
+
+    #[test]
+    fn without_the_extension_a_datagram_request_stays_reliable_on_the_base_path() {
+        let mut c = server(true);
+        hello(&mut c, "something/1");
+        let ack = open(&mut c, 1, "datagram");
+        assert_eq!((&ack["reliable"], &ack["ordered"]), (&json!(true), &json!(true)));
+        assert!(ack.get("quic").is_none());
+    }
+
+    #[test]
+    fn a_frame_on_the_wrong_path_is_discarded() {
+        let mut c = server(true);
+        hello(&mut c, QUIC_MULTISTREAM);
+        assert_eq!(open(&mut c, 1, "datagram")["quic"], "datagram");
+        let body = json!({ "id": 3, "name": "y", "reliable": true, "ordered": true });
+        c.on_frame(Frame::new(0, ctl::OPEN_CHANNEL, 0, serde_json::to_vec(&body).unwrap()), Instant::now());
+        drain(&mut c);
+
+        c.on_frame(Frame::new(1, 7, 0, b"wrong path".to_vec()), Instant::now()); // Datagram channel, on the stream.
+        c.on_datagram(Frame::new(3, 7, 0, b"wrong path".to_vec()), Instant::now()); // Stream channel, by datagram.
+        c.on_datagram(Frame::new(0, ctl::CLOSE, 0, br#"{"code":1000}"#.to_vec()), Instant::now()); // Channel 0, by datagram.
+        assert!(c.is_open());
+        assert!(c.channels[&1].recv.is_empty());
+        assert!(c.channels[&3].recv.is_empty());
+
+        c.on_datagram(Frame::new(1, 7, 0, b"right".to_vec()), Instant::now());
+        assert_eq!(c.channels[&1].recv.len(), 1);
+    }
+
+    #[test]
+    fn a_window_update_for_a_datagram_channel_closes_with_1002() {
+        let mut c = server(true);
+        hello(&mut c, QUIC_MULTISTREAM);
+        open(&mut c, 1, "datagram");
+        c.on_frame(Frame::new(0, ctl::WINDOW_UPDATE, 0, vec![0, 1, 0, 0, 16, 0]), Instant::now());
+        assert_eq!(close_code(&drain(&mut c)), Some(1002));
+    }
+
+    #[test]
+    fn taking_a_datagram_message_returns_no_credit() {
+        let mut c = server(true);
+        hello(&mut c, QUIC_MULTISTREAM);
+        open(&mut c, 1, "datagram");
+        c.on_datagram(Frame::new(1, 7, 0, vec![0u8; 500]), Instant::now());
+        let sig = c.channels[&1].sig.clone();
+        assert!(matches!(c.receive(1, &sig, Instant::now()), Some(Ok(Some(_)))));
+        assert!(c.grants.is_empty());
+        assert!(drain(&mut c).is_empty());
+    }
+
+    #[test]
+    fn a_datagram_that_overtakes_the_ack_is_held_then_delivered() {
+        let policy: Policy = Arc::new(|_| Ok(()));
+        let opts = Options { max_datagram: Some(1200), extensions: vec![QUIC_MULTISTREAM.into()], ..Options::default() };
+        let now = Instant::now();
+        let mut c = Core::new(Role::Client, opts, Some(policy), None, now).unwrap();
+        c.start_client(&[], now);
+        drain(&mut c);
+        let welcome = json!({ "version": PROTOCOL_VERSION, "extensions": [QUIC_MULTISTREAM] });
+        c.on_frame(Frame::new(0, ctl::WELCOME, 0, serde_json::to_vec(&welcome).unwrap()), now);
+        let (id, _sig, _rx) = c.open_channel(ChannelSpec::datagram("v"), now).unwrap();
+        drain(&mut c);
+
+        c.on_datagram(Frame::new(id, 7, 0, b"early".to_vec()), now);
+        assert!(c.channels[&id].recv.is_empty(), "held until the answer");
+
+        let ack = json!({ "id": id, "reliable": false, "ordered": false, "quic": "datagram" });
+        c.on_frame(Frame::new(0, ctl::CHANNEL_ACK, 0, serde_json::to_vec(&ack).unwrap()), now);
+        assert_eq!(c.channels[&id].recv.len(), 1);
+    }
+
+    #[test]
+    fn unsent_datagrams_drop_the_oldest_rather_than_grow() {
+        let mut c = server(true);
+        hello(&mut c, QUIC_MULTISTREAM);
+        open(&mut c, 1, "datagram");
+        let sig = c.channels[&1].sig.clone();
+        for i in 0..3000u32 {
+            c.send(1, &sig, 1, Bytes::from(vec![(i % 251) as u8; 1000])).unwrap();
+        }
+        assert!(c.dgram_bytes <= c.opts.max_control_queue);
+        assert_eq!(c.next_datagram().unwrap().payload[0], (((3000 - c.dgram_out.len() - 1) as u32) % 251) as u8, "the oldest kept");
     }
 }

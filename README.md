@@ -10,10 +10,12 @@ A Rust implementation of the [xumux](https://github.com/deftai/xumux) 0.3 core p
 | Stream bindings (TCP, Unix sockets, stdio) | Implemented: any `AsyncRead` and `AsyncWrite` pair |
 | `pipe/1` | Implemented, as a read and write API. Not yet `AsyncRead` and `AsyncWrite` |
 | Local strict-priority scheduling | Implemented |
-| WebSocket, WebRTC, QUIC bindings | Not yet |
-| `session-resume/1`, `webrtc-multichannel/1`, `quic-multistream/1` | Not yet |
+| WebSocket binding | Implemented |
+| QUIC binding (session stream) | Implemented, over native QUIC with quinn. Not yet WebTransport |
+| `quic-multistream/1` | Datagram channels implemented. Requests for dedicated streams are placed on the session stream, which the draft allows |
+| WebRTC binding, `session-resume/1`, `webrtc-multichannel/1` | Not yet |
 
-Checked against the spec's conformance vectors, all 57 behavioural scenarios, and [libxumux-go](https://github.com/deftai/libxumux-go) v0.4.0 in both directions.
+`quic-multistream/1` is a design draft in the spec, so this implements a proposal that may change. Checked against the spec's conformance vectors, all 57 behavioural scenarios, and [libxumux-go](https://github.com/deftai/libxumux-go) v0.4.0 in both directions.
 
 ## Design
 

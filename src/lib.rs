@@ -6,6 +6,8 @@ pub mod core;
 mod error;
 pub mod frame;
 pub mod pipe;
+#[cfg(feature = "quic")]
+pub mod quic;
 mod session;
 pub mod transport;
 #[cfg(feature = "websocket")]
