@@ -1,0 +1,493 @@
+{
+  "xumux": "0.3.0-draft",
+  "flags": {
+    "MORE": 1,
+    "PROBE": 2
+  },
+  "valid": [
+    {
+      "name": "magic",
+      "description": "Magic bytes 'XMUX', sent once before the first frame on stream bindings (TCP, Unix, stdio). Not a frame.",
+      "hex": "58 4D 55 58",
+      "decoded": {
+        "magic": "XMUX"
+      }
+    },
+    {
+      "name": "hello-minimal",
+      "description": "Minimal HELLO.",
+      "hex": "00 00 01 00 00 00 00 13 7B 22 76 65 72 73 69 6F 6E 22 3A 5B 30 2C 33 2C 30 5D 7D",
+      "decoded": {
+        "channel": 0,
+        "type": 1,
+        "flags": 0,
+        "payloadJson": {
+          "version": [
+            0,
+            3,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "hello-with-channel",
+      "description": "HELLO requesting one channel; the client picks odd ID 1.",
+      "hex": "00 00 01 00 00 00 00 77 7B 22 76 65 72 73 69 6F 6E 22 3A 5B 30 2C 33 2C 30 5D 2C 22 61 70 70 6C 69 63 61 74 69 6F 6E 22 3A 22 76 72 6F 6F 6D 2D 74 65 72 6D 69 6E 61 6C 2F 31 22 2C 22 63 68 61 6E 6E 65 6C 73 22 3A 5B 7B 22 69 64 22 3A 31 2C 22 6E 61 6D 65 22 3A 22 64 61 74 61 22 2C 22 72 65 6C 69 61 62 6C 65 22 3A 74 72 75 65 2C 22 6F 72 64 65 72 65 64 22 3A 74 72 75 65 7D 5D 7D",
+      "decoded": {
+        "channel": 0,
+        "type": 1,
+        "flags": 0,
+        "payloadJson": {
+          "version": [
+            0,
+            3,
+            0
+          ],
+          "application": "vroom-terminal/1",
+          "channels": [
+            {
+              "id": 1,
+              "name": "data",
+              "reliable": true,
+              "ordered": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "hello-extension-params",
+      "description": "HELLO with extensionParams (core 0.3 \u00a73.8). Keys for extensions the server does not accept, or that are not in extensions, are ignored.",
+      "hex": "00 00 01 00 00 00 00 79 7B 22 76 65 72 73 69 6F 6E 22 3A 5B 30 2C 33 2C 30 5D 2C 22 65 78 74 65 6E 73 69 6F 6E 73 22 3A 5B 22 73 65 73 73 69 6F 6E 2D 72 65 73 75 6D 65 2F 31 22 5D 2C 22 65 78 74 65 6E 73 69 6F 6E 50 61 72 61 6D 73 22 3A 7B 22 73 65 73 73 69 6F 6E 2D 72 65 73 75 6D 65 2F 31 22 3A 7B 7D 2C 22 78 2D 75 6E 6B 6E 6F 77 6E 2F 31 22 3A 7B 22 6C 65 76 65 6C 22 3A 33 7D 7D 7D",
+      "decoded": {
+        "channel": 0,
+        "type": 1,
+        "flags": 0,
+        "payloadJson": {
+          "version": [
+            0,
+            3,
+            0
+          ],
+          "extensions": [
+            "session-resume/1"
+          ],
+          "extensionParams": {
+            "session-resume/1": {},
+            "x-unknown/1": {
+              "level": 3
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "welcome-minimal",
+      "description": "Minimal WELCOME.",
+      "hex": "00 00 02 00 00 00 00 13 7B 22 76 65 72 73 69 6F 6E 22 3A 5B 30 2C 33 2C 30 5D 7D",
+      "decoded": {
+        "channel": 0,
+        "type": 2,
+        "flags": 0,
+        "payloadJson": {
+          "version": [
+            0,
+            3,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "welcome-accept-reject",
+      "description": "WELCOME accepting channel 1 and rejecting channel 3.",
+      "hex": "00 00 02 00 00 00 00 8A 7B 22 76 65 72 73 69 6F 6E 22 3A 5B 30 2C 33 2C 30 5D 2C 22 63 68 61 6E 6E 65 6C 73 22 3A 5B 7B 22 69 64 22 3A 31 2C 22 72 65 6C 69 61 62 6C 65 22 3A 74 72 75 65 2C 22 6F 72 64 65 72 65 64 22 3A 74 72 75 65 7D 5D 2C 22 72 65 6A 65 63 74 65 64 22 3A 5B 7B 22 69 64 22 3A 33 2C 22 63 6F 64 65 22 3A 34 30 31 30 2C 22 72 65 61 73 6F 6E 22 3A 22 75 6E 6B 6E 6F 77 6E 20 63 68 61 6E 6E 65 6C 20 6E 61 6D 65 22 7D 5D 7D",
+      "decoded": {
+        "channel": 0,
+        "type": 2,
+        "flags": 0,
+        "payloadJson": {
+          "version": [
+            0,
+            3,
+            0
+          ],
+          "channels": [
+            {
+              "id": 1,
+              "reliable": true,
+              "ordered": true
+            }
+          ],
+          "rejected": [
+            {
+              "id": 3,
+              "code": 4010,
+              "reason": "unknown channel name"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "open-channel-server",
+      "description": "Server opens a channel; servers pick even IDs.",
+      "hex": "00 00 03 00 00 00 00 35 7B 22 69 64 22 3A 32 2C 22 6E 61 6D 65 22 3A 22 66 69 6C 65 22 2C 22 72 65 6C 69 61 62 6C 65 22 3A 74 72 75 65 2C 22 6F 72 64 65 72 65 64 22 3A 74 72 75 65 7D",
+      "decoded": {
+        "channel": 0,
+        "type": 3,
+        "flags": 0,
+        "payloadJson": {
+          "id": 2,
+          "name": "file",
+          "reliable": true,
+          "ordered": true
+        }
+      }
+    },
+    {
+      "name": "channel-ack",
+      "description": "CHANNEL_ACK reporting effective properties.",
+      "hex": "00 00 04 00 00 00 00 27 7B 22 69 64 22 3A 32 2C 22 72 65 6C 69 61 62 6C 65 22 3A 74 72 75 65 2C 22 6F 72 64 65 72 65 64 22 3A 74 72 75 65 7D",
+      "decoded": {
+        "channel": 0,
+        "type": 4,
+        "flags": 0,
+        "payloadJson": {
+          "id": 2,
+          "reliable": true,
+          "ordered": true
+        }
+      }
+    },
+    {
+      "name": "close-channel",
+      "description": "CLOSE_CHANNEL (minimal). The peer answers with its own CLOSE_CHANNEL.",
+      "hex": "00 00 05 00 00 00 00 08 7B 22 69 64 22 3A 32 7D",
+      "decoded": {
+        "channel": 0,
+        "type": 5,
+        "flags": 0,
+        "payloadJson": {
+          "id": 2
+        }
+      }
+    },
+    {
+      "name": "channel-reject",
+      "description": "CHANNEL_REJECT: channel limit reached.",
+      "hex": "00 00 06 00 00 00 00 14 7B 22 69 64 22 3A 35 2C 22 63 6F 64 65 22 3A 34 30 30 32 7D",
+      "decoded": {
+        "channel": 0,
+        "type": 6,
+        "flags": 0,
+        "payloadJson": {
+          "id": 5,
+          "code": 4002
+        }
+      }
+    },
+    {
+      "name": "window-update",
+      "description": "WINDOW_UPDATE granting 65536 bytes on channel 1.",
+      "hex": "00 00 07 00 00 00 00 06 00 01 00 01 00 00",
+      "decoded": {
+        "channel": 0,
+        "type": 7,
+        "flags": 0,
+        "payloadHex": "00 01 00 01 00 00",
+        "entries": [
+          {
+            "channel": 1,
+            "increment": 65536
+          }
+        ]
+      }
+    },
+    {
+      "name": "window-update-batched",
+      "description": "WINDOW_UPDATE with two entries.",
+      "hex": "00 00 07 00 00 00 00 0C 00 01 00 00 10 00 00 02 00 00 80 00",
+      "decoded": {
+        "channel": 0,
+        "type": 7,
+        "flags": 0,
+        "payloadHex": "00 01 00 00 10 00 00 02 00 00 80 00",
+        "entries": [
+          {
+            "channel": 1,
+            "increment": 4096
+          },
+          {
+            "channel": 2,
+            "increment": 32768
+          }
+        ]
+      }
+    },
+    {
+      "name": "ping-control",
+      "description": "PING on channel 0, token 1000.",
+      "hex": "00 00 10 02 00 00 00 04 00 00 03 E8",
+      "decoded": {
+        "channel": 0,
+        "type": 16,
+        "flags": 2,
+        "payloadHex": "00 00 03 E8",
+        "token": 1000
+      }
+    },
+    {
+      "name": "pong-control",
+      "description": "PONG on channel 0 echoing token 1000.",
+      "hex": "00 00 11 02 00 00 00 04 00 00 03 E8",
+      "decoded": {
+        "channel": 0,
+        "type": 17,
+        "flags": 2,
+        "payloadHex": "00 00 03 E8",
+        "token": 1000
+      }
+    },
+    {
+      "name": "ping-channel",
+      "description": "PING on application channel 3, token 0xDEADBEEF.",
+      "hex": "00 03 10 02 00 00 00 04 DE AD BE EF",
+      "decoded": {
+        "channel": 3,
+        "type": 16,
+        "flags": 2,
+        "payloadHex": "DE AD BE EF",
+        "token": 3735928559
+      }
+    },
+    {
+      "name": "close",
+      "description": "CLOSE (minimal).",
+      "hex": "00 00 20 00 00 00 00 0D 7B 22 63 6F 64 65 22 3A 31 30 30 30 7D",
+      "decoded": {
+        "channel": 0,
+        "type": 32,
+        "flags": 0,
+        "payloadJson": {
+          "code": 1000
+        }
+      }
+    },
+    {
+      "name": "error",
+      "description": "ERROR: frame on unknown channel 9.",
+      "hex": "00 00 F0 00 00 00 00 19 7B 22 63 6F 64 65 22 3A 34 30 30 33 2C 22 63 68 61 6E 6E 65 6C 22 3A 39 7D",
+      "decoded": {
+        "channel": 0,
+        "type": 240,
+        "flags": 0,
+        "payloadJson": {
+          "code": 4003,
+          "channel": 9
+        }
+      }
+    },
+    {
+      "name": "app-message",
+      "description": "Application message type 0x01 on channel 1 (x=512, y=300 as two uint16).",
+      "hex": "00 01 01 00 00 00 00 04 02 00 01 2C",
+      "decoded": {
+        "channel": 1,
+        "type": 1,
+        "flags": 0,
+        "payloadHex": "02 00 01 2C"
+      }
+    },
+    {
+      "name": "fragmented",
+      "description": "'hello world' (type 0x05, channel 1) sent as two fragments: MORE on the first, cleared on the last.",
+      "hex": "00 01 05 01 00 00 00 05 68 65 6C 6C 6F 00 01 05 00 00 00 00 06 20 77 6F 72 6C 64",
+      "decoded": {
+        "frames": [
+          {
+            "channel": 1,
+            "type": 5,
+            "flags": 1,
+            "payloadHex": "68 65 6C 6C 6F"
+          },
+          {
+            "channel": 1,
+            "type": 5,
+            "flags": 0,
+            "payloadHex": "20 77 6F 72 6C 64"
+          }
+        ],
+        "reassembledHex": "68 65 6C 6C 6F 20 77 6F 72 6C 64"
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "bad-magic",
+      "description": "Wrong magic on a stream binding (v0.1 'OMUX').",
+      "state": "start",
+      "hex": "4F 4D 55 58",
+      "expect": {
+        "action": "close-transport"
+      }
+    },
+    {
+      "name": "reserved-flag",
+      "description": "Reserved flag bit 0x04 set without a negotiated extension.",
+      "state": "connected",
+      "hex": "00 01 01 04 00 00 00 01 00",
+      "expect": {
+        "action": "close",
+        "code": 1002
+      }
+    },
+    {
+      "name": "channel-ffff",
+      "description": "Frame on reserved channel 0xFFFF.",
+      "state": "connected",
+      "hex": "FF FF 01 00 00 00 00 00",
+      "expect": {
+        "action": "close",
+        "code": 1002
+      }
+    },
+    {
+      "name": "control-fragment",
+      "description": "MORE set on a control-channel frame.",
+      "state": "awaiting-hello",
+      "hex": "00 00 01 01 00 00 00 13 7B 22 76 65 72 73 69 6F 6E 22 3A 5B 30 2C 33 2C 30 5D 7D",
+      "expect": {
+        "action": "close",
+        "code": 1002
+      }
+    },
+    {
+      "name": "probe-fragment",
+      "description": "MORE and PROBE both set.",
+      "state": "connected",
+      "hex": "00 00 10 03 00 00 00 04 00 00 03 E8",
+      "expect": {
+        "action": "close",
+        "code": 1002
+      }
+    },
+    {
+      "name": "bad-json",
+      "description": "HELLO whose payload is not valid JSON.",
+      "state": "awaiting-hello",
+      "hex": "00 00 01 00 00 00 00 08 7B 76 65 72 73 69 6F 6E",
+      "expect": {
+        "action": "close",
+        "code": 4001
+      }
+    },
+    {
+      "name": "too-large",
+      "description": "Header declares a 4 GiB payload (over the default maxFramePayload). Reject from the header alone, before buffering.",
+      "state": "connected",
+      "hex": "00 01 01 00 FF FF FF FF",
+      "expect": {
+        "action": "close",
+        "code": 4005
+      }
+    },
+    {
+      "name": "length-mismatch",
+      "description": "Message binding: header says 8 bytes but only 4 follow.",
+      "state": "connected",
+      "hex": "00 01 01 00 00 00 00 08 00 00 00 00",
+      "expect": {
+        "action": "close",
+        "code": 4001,
+        "bindings": [
+          "websocket",
+          "webrtc"
+        ]
+      }
+    },
+    {
+      "name": "wrong-parity",
+      "description": "Server sends OPEN_CHANNEL with an odd (client-owned) ID.",
+      "state": "connected",
+      "hex": "00 00 03 00 00 00 00 32 7B 22 69 64 22 3A 37 2C 22 6E 61 6D 65 22 3A 22 78 22 2C 22 72 65 6C 69 61 62 6C 65 22 3A 74 72 75 65 2C 22 6F 72 64 65 72 65 64 22 3A 74 72 75 65 7D",
+      "expect": {
+        "action": "close",
+        "code": 1002,
+        "receiver": "client"
+      }
+    },
+    {
+      "name": "window-update-zero",
+      "description": "WINDOW_UPDATE with increment 0.",
+      "state": "connected",
+      "hex": "00 00 07 00 00 00 00 06 00 01 00 00 00 00",
+      "expect": {
+        "action": "close",
+        "code": 4001
+      }
+    },
+    {
+      "name": "window-update-control",
+      "description": "WINDOW_UPDATE entry for channel 0.",
+      "state": "connected",
+      "hex": "00 00 07 00 00 00 00 06 00 00 00 00 10 00",
+      "expect": {
+        "action": "close",
+        "code": 1002
+      }
+    },
+    {
+      "name": "hello-even-id",
+      "description": "HELLO requesting a channel with an even (server-owned) ID.",
+      "state": "awaiting-hello",
+      "hex": "00 00 01 00 00 00 00 53 7B 22 76 65 72 73 69 6F 6E 22 3A 5B 30 2C 33 2C 30 5D 2C 22 63 68 61 6E 6E 65 6C 73 22 3A 5B 7B 22 69 64 22 3A 32 2C 22 6E 61 6D 65 22 3A 22 78 22 2C 22 72 65 6C 69 61 62 6C 65 22 3A 74 72 75 65 2C 22 6F 72 64 65 72 65 64 22 3A 74 72 75 65 7D 5D 7D",
+      "expect": {
+        "action": "close",
+        "code": 1002
+      }
+    },
+    {
+      "name": "second-hello",
+      "description": "HELLO after the handshake has completed.",
+      "state": "connected",
+      "hex": "00 00 01 00 00 00 00 13 7B 22 76 65 72 73 69 6F 6E 22 3A 5B 30 2C 33 2C 30 5D 7D",
+      "expect": {
+        "action": "close",
+        "code": 1002,
+        "receiver": "server"
+      }
+    },
+    {
+      "name": "extension-params-not-object",
+      "description": "HELLO whose extensionParams is not a JSON object (core 0.3 \u00a73.8).",
+      "state": "awaiting-hello",
+      "hex": "00 00 01 00 00 00 00 2B 7B 22 76 65 72 73 69 6F 6E 22 3A 5B 30 2C 33 2C 30 5D 2C 22 65 78 74 65 6E 73 69 6F 6E 50 61 72 61 6D 73 22 3A 5B 22 78 22 5D 7D",
+      "expect": {
+        "action": "close",
+        "code": 4001
+      }
+    },
+    {
+      "name": "hello-version-0-2",
+      "description": "HELLO from a 0.2 client: 0.x minors are incompatible (\u00a73.5).",
+      "state": "awaiting-hello",
+      "hex": "00 00 01 00 00 00 00 13 7B 22 76 65 72 73 69 6F 6E 22 3A 5B 30 2C 32 2C 30 5D 7D",
+      "expect": {
+        "action": "close",
+        "code": 4006
+      }
+    },
+    {
+      "name": "limit-too-small",
+      "description": "HELLO declaring maxFramePayload below the 4096 minimum.",
+      "state": "awaiting-hello",
+      "hex": "00 00 01 00 00 00 00 2A 7B 22 76 65 72 73 69 6F 6E 22 3A 5B 30 2C 33 2C 30 5D 2C 22 6D 61 78 46 72 61 6D 65 50 61 79 6C 6F 61 64 22 3A 31 30 32 34 7D",
+      "expect": {
+        "action": "close",
+        "code": 4001
+      }
+    }
+  ]
+}
