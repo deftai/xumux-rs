@@ -177,3 +177,24 @@ async fn hello_channels_are_all_decided_before_welcome() {
     assert!(matches!(chans[2], Err(Error::Refused(ref i)) if i.code == 4010 && i.reason == "no"));
     assert_eq!(s.accept_channel().await.unwrap().name(), "slow");
 }
+
+/// The reader stops while a callback runs, so the peer's PONGs wait unread. That time must not
+/// count against the peer as silence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_policy_is_not_mistaken_for_a_silent_peer() {
+    let (a, b) = duplex(1 << 20);
+    let (ar, aw) = split(a);
+    let (br, bw) = split(b);
+    let keepalive = Options { ping_interval: 1, ping_timeout: 1, ..opts() };
+    let acceptor = Acceptor::default().policy(|_| {
+        std::thread::sleep(Duration::from_millis(2300));
+        Ok(())
+    });
+    let server = tokio::spawn(Session::accept(ar, aw, keepalive.clone(), acceptor));
+    let (c, _) = Session::connect(br, bw, keepalive, Acceptor::default(), vec![]).await.unwrap();
+    let s = server.await.unwrap().unwrap();
+    let ch = tokio::time::timeout(Duration::from_secs(5), c.open_channel(ChannelSpec::reliable("x"))).await.unwrap();
+    assert!(ch.is_ok(), "{:?}", ch.err());
+    assert!(s.close_info().is_none(), "closed with {:?}", s.close_info());
+    assert!(s.ping().await.is_ok());
+}

@@ -425,6 +425,9 @@ pub struct Core {
     next_ask: u64,
     /// Frames that arrived while a decision was pending, in order.
     backlog: VecDeque<Frame>,
+    backlog_bytes: usize,
+    /// Since when input has been paused for a decision. That time doesn't count as the peer's silence.
+    paused_at: Option<Instant>,
 }
 
 fn new_signals() -> Arc<Signals> {
@@ -570,6 +573,8 @@ impl Core {
             asked: None,
             next_ask: 0,
             backlog: VecDeque::new(),
+            backlog_bytes: 0,
+            paused_at: None,
         })
     }
 
@@ -918,7 +923,7 @@ impl Core {
                 }
             };
             match call {
-                Some(call) => self.ask_for(call),
+                Some(call) => self.ask_for(call, now),
                 None => {
                     if let Some(Pending::Hello(h)) = self.pending.take() {
                         self.welcome_hello(*h, now);
@@ -929,7 +934,8 @@ impl Core {
         }
     }
 
-    fn ask_for(&mut self, call: Call) {
+    fn ask_for(&mut self, call: Call, now: Instant) {
+        self.paused_at.get_or_insert(now);
         self.next_ask += 1;
         self.ask = Some(Ask { id: self.next_ask, call });
     }
@@ -1146,7 +1152,8 @@ impl Core {
         Some(a)
     }
 
-    /// Whether a decision is pending, handed out or not.
+    /// Whether a decision is pending, handed out or not. A driver should stop feeding input until
+    /// it isn't: what it feeds meanwhile is kept, up to the peer's credit and the control budget.
     pub fn is_deciding(&self) -> bool {
         self.pending.is_some()
     }
@@ -1176,8 +1183,27 @@ impl Core {
             }
             None => {}
         }
+        if self.pending.is_none() {
+            self.resume(now);
+        }
         while self.pending.is_none() && let Some(f) = self.backlog.pop_front() {
+            self.backlog_bytes -= f.encoded_len();
             self.on_frame_via(f, now, false);
+        }
+    }
+
+    /// Input runs again. The peer's replies waited unread during the pause, so the clocks that
+    /// judge the peer move forward by its length.
+    fn resume(&mut self, now: Instant) {
+        let Some(t) = self.paused_at.take() else { return };
+        let paused = now.saturating_duration_since(t);
+        fn shift(i: Instant, by: Duration, now: Instant) -> Instant {
+            i.checked_add(by).map_or(now, |i| i.min(now))
+        }
+        self.last_recv = shift(self.last_recv, paused, now);
+        self.keepalive_sent = self.keepalive_sent.map(|i| shift(i, paused, now));
+        for p in self.pings.values_mut() {
+            p.deadline = p.deadline.and_then(|d| d.checked_add(paused));
         }
     }
 
@@ -1255,6 +1281,15 @@ impl Core {
         // Order matters on the base path, so nothing overtakes a frame waiting on the application.
         // Datagrams have no order to keep.
         if self.pending.is_some() && !via_datagram {
+            // The bundled drivers stop reading instead (see is_deciding). A driver that doesn't
+            // gets the peer's credit and the control budget, as if the frames were processed.
+            let size = f.encoded_len();
+            let limit = usize::try_from(self.total_window).unwrap_or(usize::MAX).saturating_add(self.opts.max_control_queue);
+            if self.opts.max_control_queue > 0 && self.backlog_bytes + size > limit {
+                self.fail(code::RATE_LIMITED, "too much input while deciding", now);
+                return;
+            }
+            self.backlog_bytes += size;
             self.backlog.push_back(f);
             return;
         }
@@ -1449,7 +1484,7 @@ impl Core {
             Some(f) => {
                 let call = Call::Policy(f.clone(), spec.clone());
                 self.pending = Some(Pending::Open { id, spec });
-                self.ask_for(call);
+                self.ask_for(call, now);
             }
             None => self.open_decided(id, spec, Err(Refusal::new(code::UNSUPPORTED, "this side does not accept channels")), now),
         }
@@ -1761,6 +1796,8 @@ impl Core {
         if self.phase == Phase::Done {
             return;
         }
+        self.backlog.clear();
+        self.backlog_bytes = 0;
         self.end_channels();
         self.phase = Phase::Done;
         self.session_closed.notify_waiters();
@@ -1868,6 +1905,7 @@ impl Core {
                     }
                 return Duration::from_millis(50);
             }
+            Phase::Open if self.pending.is_some() => return self.keepalive_paused(now),
             Phase::Open => {}
         }
         let next_ping = self.expire_pings(now);
@@ -1876,6 +1914,25 @@ impl Core {
             Some(d) if self.phase == Phase::Open => wait.min(d.saturating_duration_since(now)),
             _ => wait,
         }
+    }
+
+    /// Input is paused for a decision, so silence says nothing about the peer, and its PINGs wait
+    /// unanswered. Ours still go out on time, so the peer hears from this side and doesn't take it
+    /// for dead. Their PONGs are read once input runs again.
+    fn keepalive_paused(&mut self, now: Instant) -> Duration {
+        let poll = Duration::from_millis(100);
+        if self.ping_interval == 0 {
+            return poll;
+        }
+        let idle = Duration::from_secs(self.ping_interval);
+        let since = now.saturating_duration_since(self.keepalive_sent.unwrap_or(self.last_recv));
+        if since < idle {
+            return poll.min(idle - since);
+        }
+        self.keepalive_sent = Some(now);
+        self.send_ping(0, now, None);
+        self.stats.probes_sent += 1;
+        poll
     }
 
     fn keepalive(&mut self, now: Instant) -> Duration {
@@ -3290,5 +3347,32 @@ mod decision_tests {
         assert_eq!((out[0].ty, body(&out[0])["id"].as_u64(), body(&out[0])["code"].as_u64()), (ctl::CLOSE_CHANNEL, Some(u64::from(id)), Some(1000)));
         c.on_frame(ctl_frame(ctl::CLOSE_CHANNEL, json!({ "id": id })), now);
         assert!(c.channels.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod backlog_tests {
+    use super::*;
+
+    #[test]
+    fn input_fed_while_deciding_is_bounded_and_dropped_at_the_end() {
+        let now = Instant::now();
+        let policy: Policy = Arc::new(|_| Ok(()));
+        let opts = Options { max_control_queue: 1024, ..Options::default() };
+        let mut c = Core::new(Role::Server, opts, Some(policy), None, now).unwrap();
+        c.on_frame(Frame::new(0, ctl::HELLO, 0, serde_json::to_vec(&json!({ "version": PROTOCOL_VERSION })).unwrap()), now);
+        let mut done = Vec::new();
+        while c.next_frame(&mut done).is_some() {}
+        let open = |id: u16| Frame::new(0, ctl::OPEN_CHANNEL, 0, serde_json::to_vec(&json!({ "id": id, "name": "x", "reliable": true, "ordered": true })).unwrap());
+        c.on_frame(open(1), now);
+        assert!(c.is_deciding());
+        for i in 0..40 {
+            c.on_frame(open(3 + 2 * i), now);
+        }
+        assert!(!c.is_open(), "closed with RATE_LIMITED");
+        let f = c.next_frame(&mut done).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&f.payload).unwrap()["code"], code::RATE_LIMITED);
+        c.transport_closed();
+        assert!(c.backlog.is_empty() && c.backlog_bytes == 0);
     }
 }

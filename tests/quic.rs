@@ -189,3 +189,23 @@ async fn input_on_datagrams_gets_through_beside_flat_out_bulk() {
     rtts.sort();
     eprintln!("datagram round trip beside bulk: p50 {:?}, p99 {:?}, {} of 100", rtts[rtts.len() / 2], rtts[rtts.len() * 99 / 100], rtts.len());
 }
+
+/// Cancelling the accept mid-handshake drops the session, and the QUIC connection must end with it.
+#[tokio::test]
+async fn a_cancelled_accept_ends_the_quic_connection() {
+    let (se, ce, addr) = endpoints().await;
+    let accepting = se.clone();
+    let server = tokio::spawn(async move {
+        let conn = accepting.accept().await.unwrap().await.unwrap();
+        let opts = Options { close_timeout: Duration::from_millis(200), ..Options::default() };
+        // Gives up before the handshake can finish: the client never sends a whole HELLO.
+        let r = tokio::time::timeout(Duration::from_millis(200), quic::accept(conn, opts, Acceptor::default())).await;
+        assert!(r.is_err());
+    });
+    let conn = ce.connect(addr, "localhost").unwrap().await.unwrap();
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    // Part of a frame header, so the stream reaches the server but HELLO never completes.
+    send.write_all(&[0, 0, 1]).await.unwrap();
+    server.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), conn.closed()).await.expect("the server ends the QUIC connection");
+}

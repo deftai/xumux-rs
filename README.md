@@ -34,7 +34,7 @@ channel.send(0x01, Bytes::from_static(b"hello")).await?;
 let reply = channel.receive().await?;
 ```
 
-A server passes `Acceptor::default().policy(|spec| ...)` to `Session::accept`, then takes channels from `session.accept_channel()`. The policy and `authorize` callbacks run on tokio's blocking pool, outside the session's lock, so a slow one delays only the frames that arrive after the one it is deciding. A callback that panics refuses: the channel with 4010, the HELLO with 4000.
+A server passes `Acceptor::default().policy(|spec| ...)` to `Session::accept`, then takes channels from `session.accept_channel()`. The policy and `authorize` callbacks run on tokio's blocking pool, outside the session's lock, so a slow one delays only the frames that arrive after the one it is deciding. Keepalive doesn't count that wait against the peer, and keeps sending its PINGs so the peer doesn't count it against this side. A callback that panics refuses: the channel with 4010, the HELLO with 4000.
 
 Handles close what they refer to when dropped:
 
