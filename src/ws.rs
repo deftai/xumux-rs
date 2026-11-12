@@ -58,6 +58,8 @@ pub async fn accept<S>(stream: S, opts: Options, acceptor: Acceptor, allow_origi
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // The error type is fixed by tungstenite's callback signature.
+    #[allow(clippy::result_large_err)]
     let callback = |req: &Request, mut res: Response| -> std::result::Result<Response, ErrorResponse> {
         let refuse = |status: StatusCode, why: &str| {
             let mut r = ErrorResponse::new(Some(why.to_owned()));

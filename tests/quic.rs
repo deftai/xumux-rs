@@ -51,7 +51,7 @@ async fn the_session_stream_carries_reliable_channels_of_any_size() {
     let (s, c, _a, _b) = pair().await;
     let tx = c.open_channel(ChannelSpec::reliable("a")).await.unwrap();
     let rx = s.accept_channel().await.unwrap();
-    assert_eq!(tx.properties().unwrap().reliable, true);
+    assert!(tx.properties().unwrap().reliable);
     let big = Bytes::from(vec![9u8; 200_000]);
     tx.send(4, big.clone()).await.unwrap();
     let m = rx.receive().await.unwrap().unwrap();
@@ -66,7 +66,7 @@ async fn a_datagram_channel_is_unreliable_and_carries_messages() {
     let rx = s.accept_channel().await.unwrap();
     let p = tx.properties().unwrap();
     assert_eq!((p.reliable, p.ordered), (false, false));
-    assert_eq!(rx.properties().unwrap().reliable, false);
+    assert!(!rx.properties().unwrap().reliable);
     assert!(tx.max_datagram_payload().unwrap() > 1000);
     assert_eq!(tx.send_credit().unwrap(), u64::MAX, "not flow-controlled");
 
@@ -126,7 +126,7 @@ async fn a_request_for_a_dedicated_stream_lands_on_the_session_stream() {
     let spec = ChannelSpec { quic: Some("stream".into()), ..ChannelSpec::reliable("s") };
     let tx = c.open_channel(spec).await.unwrap();
     let rx = s.accept_channel().await.unwrap();
-    assert_eq!(tx.properties().unwrap().reliable, true);
+    assert!(tx.properties().unwrap().reliable);
     assert!(tx.max_datagram_payload().is_none());
     tx.send(1, Bytes::from(vec![0u8; 100_000])).await.unwrap();
     assert_eq!(rx.receive().await.unwrap().unwrap().payload.len(), 100_000);

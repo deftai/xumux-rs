@@ -47,13 +47,12 @@ async fn messages_cross_and_the_close_exchange_completes() {
 async fn expect_close(mut w: tokio_tungstenite::WebSocketStream<TcpStream>, send: Message, want: u64) {
     w.send(send).await.unwrap();
     while let Some(Ok(m)) = tokio::time::timeout(Duration::from_secs(2), w.next()).await.unwrap() {
-        if let Message::Binary(b) = m {
-            if b[2] == 0x20 {
+        if let Message::Binary(b) = m
+            && b[2] == 0x20 {
                 let v: serde_json::Value = serde_json::from_slice(&b[8..]).unwrap();
                 assert_eq!(v["code"].as_u64(), Some(want));
                 return;
             }
-        }
     }
     panic!("no CLOSE arrived");
 }
