@@ -22,6 +22,32 @@ impl Shared {
     fn lock(&self) -> MutexGuard<'_, Core> {
         self.core.lock().expect("core lock")
     }
+
+    fn closed_error(&self) -> Error {
+        Error::Closed(self.lock().close_info().unwrap_or(CloseInfo { code: code::GOING_AWAY, reason: String::new() }))
+    }
+
+    /// Runs `f`, giving up once the connection is done. `None` means it gave up. A peer that stops
+    /// reading or writing must not keep a task, and with it the transport, alive after the end.
+    async fn until_done<F: Future>(&self, f: F) -> Option<F::Output> {
+        let closed = self.closed.notified();
+        tokio::pin!(closed);
+        closed.as_mut().enable();
+        if self.lock().is_done() {
+            return None;
+        }
+        tokio::select! {
+            r = f => Some(r),
+            _ = closed => None,
+        }
+    }
+}
+
+/// Tells the senders whose frames were in a write how it went.
+fn complete(completed: &mut Vec<tokio::sync::oneshot::Sender<Result<()>>>, r: Result<()>) {
+    for c in completed.drain(..) {
+        let _ = c.send(r.clone());
+    }
 }
 
 /// One xumux connection.
@@ -223,7 +249,7 @@ impl Session {
     }
 
     fn closed_error(&self) -> Error {
-        Error::Closed(self.shared.lock().close_info().unwrap_or(CloseInfo { code: code::GOING_AWAY, reason: String::new() }))
+        self.shared.closed_error()
     }
 
     /// The next channel the peer opened, or `None` once the connection has ended.
@@ -305,7 +331,7 @@ impl Session {
 
 async fn read_loop<R: AsyncRead + Unpin>(shared: Arc<Shared>, mut r: R, use_magic: bool) {
     let mut magic = [0u8; 4];
-    let ok = !use_magic || (r.read_exact(&mut magic).await.is_ok() && magic == MAGIC);
+    let ok = !use_magic || matches!(shared.until_done(r.read_exact(&mut magic)).await, Some(Ok(_)) if magic == MAGIC);
     if !ok {
         // Core: on a mismatch, close the transport without sending anything.
         shared.lock().transport_closed();
@@ -315,14 +341,14 @@ async fn read_loop<R: AsyncRead + Unpin>(shared: Arc<Shared>, mut r: R, use_magi
     }
     let mut header = [0u8; HEADER_LEN];
     loop {
-        if r.read_exact(&mut header).await.is_err() {
+        if !matches!(shared.until_done(r.read_exact(&mut header)).await, Some(Ok(_))) {
             break;
         }
         let Header { channel, ty, flags, len } = parse_header(&header);
         let limit = shared.lock().frame_limit(channel);
         if len > limit {
             // Core §2.3 step 1: refuse without reading or buffering the payload.
-            shared.lock().fail(code::MESSAGE_TOO_LARGE, "frame exceeds the receiver's limit");
+            shared.lock().fail(code::MESSAGE_TOO_LARGE, "frame exceeds the receiver's limit", Instant::now());
             shared.wake_writer.notify_one();
             shared.wake_timer.notify_one();
             break;
@@ -330,7 +356,7 @@ async fn read_loop<R: AsyncRead + Unpin>(shared: Arc<Shared>, mut r: R, use_magi
         let mut payload = BytesMut::with_capacity(len as usize);
         if len > 0 {
             payload.resize(len as usize, 0);
-            if r.read_exact(&mut payload).await.is_err() {
+            if !matches!(shared.until_done(r.read_exact(&mut payload)).await, Some(Ok(_))) {
                 break;
             }
         }
@@ -383,22 +409,32 @@ async fn write_loop<W: AsyncWrite + Unpin>(shared: Arc<Shared>, mut w: W, use_ma
             (core.close_written(), core.is_done())
         };
         if !buf.is_empty() {
-            let failed = w.write_all(&buf).await.is_err() || w.flush().await.is_err();
+            let written = shared.until_done(async { w.write_all(&buf).await?; w.flush().await }).await;
             buf.clear();
-            for c in completed.drain(..) {
-                let _ = c.send(Ok(()));
-            }
-            if failed {
-                shared.lock().transport_closed();
-                shared.closed.notify_waiters();
-                return;
+            match written {
+                Some(Ok(())) => complete(&mut completed, Ok(())),
+                Some(Err(_)) => {
+                    shared.lock().transport_closed();
+                    complete(&mut completed, Err(shared.closed_error()));
+                    shared.closed.notify_waiters();
+                    return;
+                }
+                // Done while the write was stuck: the peer stopped reading, so drop it.
+                None => {
+                    complete(&mut completed, Err(shared.closed_error()));
+                    return;
+                }
             }
             if !close_now && !done {
                 continue;
             }
         }
         if close_now || done {
-            let _ = w.shutdown().await;
+            if done {
+                let _ = w.shutdown().await;
+            } else if shared.until_done(w.shutdown()).await.is_none() {
+                return;
+            }
             let mut core = shared.lock();
             core.close_write_done(Instant::now());
             let finished = core.is_done();
@@ -433,7 +469,7 @@ pub trait MessageWriter: Send + 'static {
 }
 
 async fn read_messages<R: MessageReader>(shared: Arc<Shared>, mut r: R) {
-    while let Some(msg) = r.read().await {
+    while let Some(Some(msg)) = shared.until_done(r.read()).await {
         let failure = match msg {
             Incoming::Text => Some((code::PROTOCOL_ERROR, "text message on a binary binding")),
             Incoming::Binary(mut b) if b.len() >= HEADER_LEN => {
@@ -463,7 +499,7 @@ async fn read_messages<R: MessageReader>(shared: Arc<Shared>, mut r: R) {
             Incoming::Binary(_) => Some((code::INVALID_MESSAGE, "message shorter than a frame header")),
         };
         if let Some((c, reason)) = failure {
-            shared.lock().fail(c, reason);
+            shared.lock().fail(c, reason, Instant::now());
             shared.wake_writer.notify_one();
             shared.wake_timer.notify_one();
         }
@@ -490,14 +526,19 @@ async fn write_messages<W: MessageWriter>(shared: Arc<Shared>, mut w: W) {
         if let Some(f) = frame {
             let mut buf = BytesMut::with_capacity(f.encoded_len());
             f.encode_into(&mut buf);
-            let failed = w.write(buf.freeze()).await.is_err();
-            for c in completed.drain(..) {
-                let _ = c.send(Ok(()));
-            }
-            if failed {
-                shared.lock().transport_closed();
-                shared.closed.notify_waiters();
-                return;
+            match shared.until_done(w.write(buf.freeze())).await {
+                Some(Ok(())) => complete(&mut completed, Ok(())),
+                Some(Err(_)) => {
+                    shared.lock().transport_closed();
+                    complete(&mut completed, Err(shared.closed_error()));
+                    shared.closed.notify_waiters();
+                    return;
+                }
+                // Done while the write was stuck: the peer stopped reading, so drop it.
+                None => {
+                    complete(&mut completed, Err(shared.closed_error()));
+                    return;
+                }
             }
         }
         if close_now || done {
@@ -557,6 +598,10 @@ async fn write_datagrams<D: DatagramPath>(shared: Arc<Shared>, d: D) {
         let waiting = shared.wake_datagrams.notified();
         tokio::pin!(waiting);
         waiting.as_mut().enable();
+        // Enabled before the check below, so a close between the check and the wait isn't missed.
+        let closed = shared.closed.notified();
+        tokio::pin!(closed);
+        closed.as_mut().enable();
         let frames: Vec<Frame> = {
             let mut core = shared.lock();
             core.set_max_datagram(d.max_size());
@@ -575,7 +620,6 @@ async fn write_datagrams<D: DatagramPath>(shared: Arc<Shared>, d: D) {
             d.write(buf.freeze());
         }
         if frames.is_empty() {
-            let closed = shared.closed.notified();
             tokio::select! {
                 _ = waiting => {}
                 _ = closed => {}
@@ -755,7 +799,7 @@ impl Channel {
 
     /// Closes, and waits until the peer has answered.
     pub async fn close(&self, c: u16, reason: Option<&str>) {
-        let rx = self.core().close_channel(self.id, &self.sig, c, reason);
+        let rx = self.core().close_channel(self.id, &self.sig, c, reason, Instant::now());
         self.wake();
         let _ = rx.await;
     }
@@ -774,3 +818,59 @@ impl Channel {
     }
 }
 
+
+#[cfg(all(test, feature = "quic"))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A path that never delivers, and raises `go` each time the writer looks at it under the lock.
+    #[derive(Clone)]
+    struct Path {
+        go: Arc<AtomicBool>,
+        alive: Arc<()>,
+    }
+
+    impl DatagramPath for Path {
+        async fn read(&self) -> Option<Bytes> {
+            std::future::pending().await
+        }
+        fn write(&self, _: Bytes) {}
+        fn max_size(&self) -> Option<usize> {
+            self.go.store(true, Ordering::SeqCst);
+            None
+        }
+    }
+
+    // The close lands just after write_datagrams released the lock and before it waits. The window
+    // is tiny, so this races many times; each miss leaves the task parked for good.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_datagrams_ends_on_a_close_that_races_its_wait() {
+        for _ in 0..20000 {
+            let core = Core::new(Role::Server, Options::default(), None, None, Instant::now()).unwrap();
+            let shared = Arc::new(Shared { core: Mutex::new(core), wake_writer: Notify::new(), wake_datagrams: Notify::new(), wake_timer: Notify::new(), closed: Notify::new() });
+            let path = Path { go: Arc::new(AtomicBool::new(false)), alive: Arc::new(()) };
+            let (go, alive) = (path.go.clone(), Arc::downgrade(&path.alive));
+            let closer = {
+                let shared = shared.clone();
+                std::thread::spawn(move || {
+                    while !go.load(Ordering::SeqCst) {
+                        std::hint::spin_loop();
+                    }
+                    let mut core = loop {
+                        if let Ok(c) = shared.core.try_lock() {
+                            break c;
+                        }
+                    };
+                    core.transport_closed();
+                    drop(core);
+                    shared.closed.notify_waiters();
+                })
+            };
+            let task = tokio::spawn(write_datagrams(shared.clone(), path));
+            closer.join().unwrap();
+            let ended = tokio::time::timeout(Duration::from_millis(500), task).await.is_ok();
+            assert!(ended && alive.upgrade().is_none(), "write_datagrams missed the close");
+        }
+    }
+}

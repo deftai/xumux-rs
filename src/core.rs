@@ -524,19 +524,19 @@ impl Core {
 
     // --- Output ---
 
-    fn queue_ctrl(&mut self, ty: u8, body: &Value) {
+    fn queue_ctrl(&mut self, ty: u8, body: &Value, now: Instant) {
         if self.close_queued {
             return;
         }
         let payload = Bytes::from(serde_json::to_vec(body).expect("JSON encodes"));
-        self.queue_ctrl_frame(Frame::new(0, ty, 0, payload));
+        self.queue_ctrl_frame(Frame::new(0, ty, 0, payload), now);
     }
 
     /// Replies pile up if the peer doesn't read them (core §4.2).
-    fn queue_ctrl_frame(&mut self, f: Frame) {
+    fn queue_ctrl_frame(&mut self, f: Frame, now: Instant) {
         let size = f.encoded_len();
         if self.over_control_budget(size) {
-            self.fail(code::RATE_LIMITED, "too many unread control replies");
+            self.fail(code::RATE_LIMITED, "too many unread control replies", now);
             return;
         }
         self.ctrl_bytes += size;
@@ -548,10 +548,10 @@ impl Core {
     }
 
     /// A PONG is a reply too, so a peer that sends PINGs and never reads is closed, not queued for.
-    fn queue_probe(&mut self, f: Frame) {
+    fn queue_probe(&mut self, f: Frame, now: Instant) {
         let size = f.encoded_len();
         if self.over_control_budget(size) {
-            self.fail(code::RATE_LIMITED, "too many unread probe replies");
+            self.fail(code::RATE_LIMITED, "too many unread probe replies", now);
             return;
         }
         self.probe_bytes += size;
@@ -708,7 +708,7 @@ impl Core {
         if !self.opts.extensions.is_empty() {
             hello["extensions"] = json!(self.opts.extensions);
         }
-        self.queue_ctrl(ctl::HELLO, &hello);
+        self.queue_ctrl(ctl::HELLO, &hello, now);
         out
     }
 
@@ -729,7 +729,7 @@ impl Core {
     fn on_hello(&mut self, payload: &[u8], now: Instant) {
         match self.handle_hello(payload, now) {
             Ok(()) => {}
-            Err(r) => self.fail(r.code, &r.reason),
+            Err(r) => self.fail(r.code, &r.reason, now),
         }
     }
 
@@ -811,7 +811,7 @@ impl Core {
             "channels": accepted,
             "rejected": rejected,
         });
-        self.queue_ctrl(ctl::WELCOME, &welcome);
+        self.queue_ctrl(ctl::WELCOME, &welcome, now);
         self.ping_interval = self.opts.ping_interval;
         self.ping_timeout = self.opts.ping_timeout;
         self.phase = Phase::Open;
@@ -825,9 +825,9 @@ impl Core {
         Ok(())
     }
 
-    fn on_welcome(&mut self, payload: &[u8]) {
+    fn on_welcome(&mut self, payload: &[u8], now: Instant) {
         if let Err(r) = self.handle_welcome(payload) {
-            self.fail(r.code, &r.reason);
+            self.fail(r.code, &r.reason, now);
         }
     }
 
@@ -993,20 +993,20 @@ impl Core {
         }
         // Step 3.
         if f.channel == RESERVED_CHANNEL || f.flags & !(MORE | PROBE) != 0 {
-            self.fail(code::PROTOCOL_ERROR, "reserved channel or flag");
+            self.fail(code::PROTOCOL_ERROR, "reserved channel or flag", now);
             return;
         }
         if f.channel == 0 && f.flags & MORE != 0 {
-            self.fail(code::PROTOCOL_ERROR, "MORE on channel 0");
+            self.fail(code::PROTOCOL_ERROR, "MORE on channel 0", now);
             return;
         }
         if f.flags & MORE != 0 && f.flags & PROBE != 0 {
-            self.fail(code::PROTOCOL_ERROR, "MORE on a probe");
+            self.fail(code::PROTOCOL_ERROR, "MORE on a probe", now);
             return;
         }
         if self.phase == Phase::CloseSent {
             if f.channel == 0 && f.flags & PROBE == 0 && f.ty == ctl::CLOSE {
-                self.on_close(&f.payload);
+                self.on_close(&f.payload, now);
             }
             return;
         }
@@ -1033,7 +1033,7 @@ impl Core {
         } else if f.channel == 0 {
             self.on_control(f, now);
         } else {
-            self.on_data(f);
+            self.on_data(f, now);
         }
     }
 
@@ -1044,18 +1044,18 @@ impl Core {
                 if control && f.ty == ctl::HELLO {
                     self.on_hello(&f.payload, now);
                 } else if control && f.ty == ctl::CLOSE {
-                    self.on_close(&f.payload);
+                    self.on_close(&f.payload, now);
                 } else {
-                    self.fail(code::PROTOCOL_ERROR, "the first frame must be HELLO");
+                    self.fail(code::PROTOCOL_ERROR, "the first frame must be HELLO", now);
                 }
             }
             Role::Client => {
                 if control && f.ty == ctl::WELCOME {
-                    self.on_welcome(&f.payload);
+                    self.on_welcome(&f.payload, now);
                 } else if control && f.ty == ctl::CLOSE {
-                    self.on_close(&f.payload);
+                    self.on_close(&f.payload, now);
                 } else {
-                    self.fail(code::PROTOCOL_ERROR, "expected WELCOME");
+                    self.fail(code::PROTOCOL_ERROR, "expected WELCOME", now);
                 }
             }
         }
@@ -1072,7 +1072,7 @@ impl Core {
             }
         }
         if f.ty == PING {
-            self.push_probe(Frame::new(f.channel, PONG, PROBE, f.payload));
+            self.push_probe(Frame::new(f.channel, PONG, PROBE, f.payload), now);
             return;
         }
         let token = u32::from_be_bytes([f.payload[0], f.payload[1], f.payload[2], f.payload[3]]);
@@ -1096,11 +1096,11 @@ impl Core {
     }
 
     /// A probe travels on its channel's path.
-    fn push_probe(&mut self, f: Frame) {
+    fn push_probe(&mut self, f: Frame, now: Instant) {
         if self.channels.get(&f.channel).is_some_and(|c| c.datagram) {
             self.push_datagram(f);
         } else {
-            self.queue_probe(f);
+            self.queue_probe(f, now);
         }
     }
 
@@ -1135,20 +1135,20 @@ impl Core {
             ctl::OPEN_CHANNEL => self.on_open_channel(&f.payload, now),
             ctl::CHANNEL_ACK => self.on_channel_ack(&f.payload, now),
             ctl::CHANNEL_REJECT => self.on_channel_reject(&f.payload),
-            ctl::CLOSE_CHANNEL => self.on_close_channel(&f.payload),
+            ctl::CLOSE_CHANNEL => self.on_close_channel(&f.payload, now),
             ctl::WINDOW_UPDATE => self.on_window_update(&f.payload),
             ctl::CLOSE => {
-                self.on_close(&f.payload);
+                self.on_close(&f.payload, now);
                 Ok(())
             }
             ctl::ERROR => self.on_error(&f.payload),
             other => {
-                self.queue_ctrl(ctl::ERROR, &json!({ "code": code::UNSUPPORTED, "reason": format!("unknown control type {other:#04x}") }));
+                self.queue_ctrl(ctl::ERROR, &json!({ "code": code::UNSUPPORTED, "reason": format!("unknown control type {other:#04x}") }), now);
                 Ok(())
             }
         };
         if let Err(r) = r {
-            self.fail(r.code, &r.reason);
+            self.fail(r.code, &r.reason, now);
         }
     }
 
@@ -1176,19 +1176,19 @@ impl Core {
         let id = id as u16;
         let peer_opened = self.channels.keys().filter(|i| u64::from(**i) % 2 == self.peer_parity()).count();
         if peer_opened >= self.opts.max_channels {
-            self.queue_ctrl(ctl::CHANNEL_REJECT, &json!({ "id": id, "code": code::CHANNEL_LIMIT, "reason": "too many channels" }));
+            self.queue_ctrl(ctl::CHANNEL_REJECT, &json!({ "id": id, "code": code::CHANNEL_LIMIT, "reason": "too many channels" }), now);
             return Ok(());
         }
         match self.decide(&spec) {
             Ok(()) => {
                 let sig = self.insert_channel(id, ChanState::Open, now);
                 let ack = self.accept_path(id, &spec);
-                self.queue_ctrl(ctl::CHANNEL_ACK, &ack);
+                self.queue_ctrl(ctl::CHANNEL_ACK, &ack, now);
                 self.accepted.push_back(Accepted { id, spec, sig });
                 self.wake_accept.notify_waiters();
             }
             Err(r) => {
-                self.queue_ctrl(ctl::CHANNEL_REJECT, &json!({ "id": id, "code": r.code, "reason": r.reason }));
+                self.queue_ctrl(ctl::CHANNEL_REJECT, &json!({ "id": id, "code": r.code, "reason": r.reason }), now);
             }
         }
         Ok(())
@@ -1257,13 +1257,13 @@ impl Core {
         Ok(())
     }
 
-    fn on_close_channel(&mut self, payload: &[u8]) -> std::result::Result<(), Refusal> {
+    fn on_close_channel(&mut self, payload: &[u8], now: Instant) -> std::result::Result<(), Refusal> {
         let o = parse_object(payload)?;
         let id = int_field(&o, "id")?;
         let c = opt_int(&o, "code")?.unwrap_or(u64::from(code::NORMAL));
         let reason = opt_str(&o, "reason")?.unwrap_or_default();
         if id == 0 {
-            self.queue_ctrl(ctl::ERROR, &json!({ "code": code::PROTOCOL_ERROR, "reason": "channel 0 closes only with the connection" }));
+            self.queue_ctrl(ctl::ERROR, &json!({ "code": code::PROTOCOL_ERROR, "reason": "channel 0 closes only with the connection" }), now);
             return Ok(());
         }
         let Some(id) = u16::try_from(id).ok().filter(|i| self.channels.contains_key(i)) else {
@@ -1282,7 +1282,7 @@ impl Core {
         ch.sig.recv.notify_waiters();
         ch.sig.credit.notify_waiters();
         if !ch.sent_close {
-            self.send_close_channel(id, c as u16, None);
+            self.send_close_channel(id, c as u16, None, now);
         }
         self.maybe_finish(id);
         Ok(())
@@ -1317,7 +1317,7 @@ impl Core {
         Ok(())
     }
 
-    fn on_data(&mut self, f: Frame) {
+    fn on_data(&mut self, f: Frame, now: Instant) {
         let max_message = self.opts.limits.max_message_size as usize;
         let Some(ch) = self.channels.get_mut(&f.channel) else {
             return; // Core §5.5: discard. ERROR 4003 is optional, and only adds traffic.
@@ -1328,7 +1328,7 @@ impl Core {
         let len = f.payload.len() as u64;
         if ch.props.reliable {
             if len > ch.recv_credit {
-                self.fail(code::FLOW_CONTROL_ERROR, "peer exceeded its credit");
+                self.fail(code::FLOW_CONTROL_ERROR, "peer exceeded its credit", now);
                 return;
             }
             ch.recv_credit -= len;
@@ -1337,17 +1337,17 @@ impl Core {
         let more = f.flags & MORE != 0;
         let id = f.channel;
         if more && !can_fragment {
-            self.close_channel_with(id, code::PROTOCOL_ERROR, "MORE on a channel that can't fragment");
+            self.close_channel_with(id, code::PROTOCOL_ERROR, "MORE on a channel that can't fragment", now);
             return;
         }
         if let Some((ty, _)) = ch.reasm.as_ref()
             && *ty != f.ty {
-                self.close_channel_with(id, code::PROTOCOL_ERROR, "type changed within a message");
+                self.close_channel_with(id, code::PROTOCOL_ERROR, "type changed within a message", now);
                 return;
             }
         let so_far = ch.reasm.as_ref().map_or(0, |(_, b)| b.len());
         if so_far + f.payload.len() > max_message {
-            self.close_channel_with(id, code::MESSAGE_TOO_LARGE, "message exceeds maxMessageSize");
+            self.close_channel_with(id, code::MESSAGE_TOO_LARGE, "message exceeds maxMessageSize", now);
             return;
         }
         if !more && ch.reasm.is_none() {
@@ -1365,7 +1365,7 @@ impl Core {
         }
     }
 
-    fn on_close(&mut self, payload: &[u8]) {
+    fn on_close(&mut self, payload: &[u8], now: Instant) {
         let (c, reason) = match parse_object(payload) {
             Ok(o) => (
                 o.get("code").and_then(Value::as_u64).unwrap_or(u64::from(code::PROTOCOL_ERROR)) as u16,
@@ -1386,9 +1386,11 @@ impl Core {
                 // Never written after CLOSE, and they would count against the budget the reply needs.
                 self.probes_out.clear();
                 self.probe_bytes = 0;
-                self.queue_ctrl(ctl::CLOSE, &json!({ "code": c }));
+                self.queue_ctrl(ctl::CLOSE, &json!({ "code": c }), now);
                 self.close_queued = true;
                 self.peer_closed = true;
+                // As in fail: a peer that sent CLOSE and stopped reading can't hold the connection open.
+                self.close_sent_at.get_or_insert(now);
                 self.end_channels();
             }
         }
@@ -1397,7 +1399,7 @@ impl Core {
     // --- Closing ---
 
     /// A protocol failure, or the local application closing: send CLOSE.
-    pub fn fail(&mut self, c: u16, reason: &str) {
+    pub fn fail(&mut self, c: u16, reason: &str, now: Instant) {
         if self.close_queued || self.phase == Phase::Done {
             return;
         }
@@ -1408,18 +1410,20 @@ impl Core {
         self.probes_out.clear();
         self.probe_bytes = 0;
         let body = if reason.is_empty() { json!({ "code": c }) } else { json!({ "code": c, "reason": reason }) };
-        self.queue_ctrl(ctl::CLOSE, &body);
+        self.queue_ctrl(ctl::CLOSE, &body, now);
         self.close_queued = true;
         self.phase = Phase::CloseSent;
+        // The wait for the peer's CLOSE starts now, not once ours is written: if the peer has
+        // stopped reading, the write never finishes, and only this timeout ends the connection.
+        self.close_sent_at.get_or_insert(now);
         self.end_channels();
     }
 
     pub fn close(&mut self, c: u16, reason: &str, now: Instant) {
-        self.close_sent_at.get_or_insert(now);
-        self.fail(c, reason);
+        self.fail(c, reason, now);
     }
 
-    /// Record when CLOSE went out, which starts the wait for the peer's.
+    /// CLOSE went out. If it was the reply to the peer's, the exchange is over.
     pub fn close_write_done(&mut self, now: Instant) {
         self.close_sent_at.get_or_insert(now);
         if self.peer_closed {
@@ -1489,20 +1493,20 @@ impl Core {
         self.sendable.remove(&(prio, id));
     }
 
-    fn send_close_channel(&mut self, id: u16, c: u16, reason: Option<&str>) {
+    fn send_close_channel(&mut self, id: u16, c: u16, reason: Option<&str>, now: Instant) {
         self.grants.remove(&id);
         let mut body = json!({ "id": id, "code": c });
         if let Some(r) = reason {
             body["reason"] = json!(r);
         }
-        self.queue_ctrl(ctl::CLOSE_CHANNEL, &body);
+        self.queue_ctrl(ctl::CLOSE_CHANNEL, &body, now);
         if let Some(ch) = self.channels.get_mut(&id) {
             ch.sent_close = true;
         }
     }
 
     /// A channel-level error: core §7.
-    fn close_channel_with(&mut self, id: u16, c: u16, reason: &str) {
+    fn close_channel_with(&mut self, id: u16, c: u16, reason: &str, now: Instant) {
         let Some(ch) = self.channels.get_mut(&id) else { return };
         ch.state = ChanState::Closing;
         ch.reasm = None;
@@ -1510,7 +1514,7 @@ impl Core {
         ch.sig.recv.notify_waiters();
         ch.sig.credit.notify_waiters();
         self.abort_sends(id);
-        self.send_close_channel(id, c, Some(reason));
+        self.send_close_channel(id, c, Some(reason), now);
     }
 
     fn maybe_finish(&mut self, id: u16) {
@@ -1543,8 +1547,8 @@ impl Core {
             Phase::Handshake => {
                 if now.saturating_duration_since(self.started) >= self.opts.handshake_timeout {
                     match self.role {
-                        Role::Server => self.fail(code::HELLO_TIMEOUT, "no HELLO within the timeout"),
-                        Role::Client => self.fail(code::GOING_AWAY, "no WELCOME within the timeout"),
+                        Role::Server => self.fail(code::HELLO_TIMEOUT, "no HELLO within the timeout", now),
+                        Role::Client => self.fail(code::GOING_AWAY, "no WELCOME within the timeout", now),
                     }
                 }
                 return Duration::from_millis(100).min(self.opts.handshake_timeout);
@@ -1566,7 +1570,7 @@ impl Core {
         if let Some(sent) = self.keepalive_sent {
             if now.saturating_duration_since(sent) >= timeout {
                 self.close_info.get_or_insert(CloseInfo { code: code::KEEPALIVE_TIMEOUT, reason: "peer stopped responding".into() });
-                self.fail(code::KEEPALIVE_TIMEOUT, "peer stopped responding");
+                self.fail(code::KEEPALIVE_TIMEOUT, "peer stopped responding", now);
                 return Duration::from_millis(50);
             }
             return timeout - now.saturating_duration_since(sent);
@@ -1575,7 +1579,7 @@ impl Core {
         if quiet >= idle {
             self.keepalive_sent = Some(now);
             let token = self.new_token(now);
-            self.queue_probe(Frame::new(0, PING, PROBE, Bytes::copy_from_slice(&token.to_be_bytes())));
+            self.queue_probe(Frame::new(0, PING, PROBE, Bytes::copy_from_slice(&token.to_be_bytes())), now);
             self.stats.probes_sent += 1;
             return timeout;
         }
@@ -1613,7 +1617,7 @@ impl Core {
         let ch = self.channels.get_mut(&id).expect("present");
         ch.open_waiter = Some(tx);
         ch.asked_datagram = spec.quic.as_deref() == Some("datagram");
-        self.queue_ctrl(ctl::OPEN_CHANNEL, &body);
+        self.queue_ctrl(ctl::OPEN_CHANNEL, &body, now);
         Ok((id, sig, rx))
     }
 
@@ -1819,7 +1823,7 @@ impl Core {
             ch.stats.probes_sent += 1;
             let token = self.new_token(now);
             self.pings.insert(token, PendingPing { channel: id, sig: None, sent: now, waiter: None });
-            self.push_probe(Frame::new(id, PING, PROBE, Bytes::copy_from_slice(&token.to_be_bytes())));
+            self.push_probe(Frame::new(id, PING, PROBE, Bytes::copy_from_slice(&token.to_be_bytes())), now);
         }
     }
 
@@ -1843,7 +1847,7 @@ impl Core {
         let token = self.new_token(now);
         let (tx, rx) = oneshot::channel();
         self.pings.insert(token, PendingPing { channel: ch_id, sig: None, sent: now, waiter: Some(tx) });
-        self.push_probe(Frame::new(ch_id, PING, PROBE, Bytes::copy_from_slice(&token.to_be_bytes())));
+        self.push_probe(Frame::new(ch_id, PING, PROBE, Bytes::copy_from_slice(&token.to_be_bytes())), now);
         Ok(rx)
     }
 
@@ -1863,7 +1867,7 @@ impl Core {
     }
 
     /// Start closing. The receiver resolves when the channel is fully closed.
-    pub(crate) fn close_channel(&mut self, id: u16, sig: &Arc<Signals>, c: u16, reason: Option<&str>) -> oneshot::Receiver<()> {
+    pub(crate) fn close_channel(&mut self, id: u16, sig: &Arc<Signals>, c: u16, reason: Option<&str>, now: Instant) -> oneshot::Receiver<()> {
         let (tx, rx) = oneshot::channel();
         if sig.finished.lock().unwrap().is_some() {
             let _ = tx.send(());
@@ -1883,7 +1887,7 @@ impl Core {
         ch.reasm = None;
         ch.sig.recv.notify_waiters();
         self.abort_sends(id);
-        self.send_close_channel(id, c, reason);
+        self.send_close_channel(id, c, reason, now);
         self.maybe_finish(id);
         rx
     }
