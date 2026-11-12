@@ -1162,6 +1162,8 @@ impl Core {
     /// closed meanwhile, is ignored.
     pub fn decided(&mut self, ask: u64, answer: std::result::Result<(), Refusal>, now: Instant) {
         if self.asked != Some(ask) {
+            // A close dropped the decision, but a peer CLOSE may wait in the backlog.
+            self.drain_backlog(now);
             return;
         }
         self.asked = None;
@@ -1183,6 +1185,11 @@ impl Core {
             }
             None => {}
         }
+        self.drain_backlog(now);
+    }
+
+    /// Once nothing is pending, the frames kept meanwhile run in order, until one parks again.
+    fn drain_backlog(&mut self, now: Instant) {
         if self.pending.is_none() {
             self.resume(now);
         }
@@ -1202,7 +1209,9 @@ impl Core {
         }
         self.last_recv = shift(self.last_recv, paused, now);
         self.keepalive_sent = self.keepalive_sent.map(|i| shift(i, paused, now));
-        for p in self.pings.values_mut() {
+        // Datagram probes kept being read and expired during the pause, so they keep their deadlines.
+        let channels = &self.channels;
+        for p in self.pings.values_mut().filter(|p| !channels.get(&p.channel).is_some_and(|c| c.datagram)) {
             p.deadline = p.deadline.and_then(|d| d.checked_add(paused));
         }
     }
@@ -1257,6 +1266,13 @@ impl Core {
 
     /// One received frame, after framing has applied core §2.3 steps 1-2.
     pub fn on_frame(&mut self, f: Frame, now: Instant) {
+        if !self.backlog.is_empty() && self.pending.is_none() {
+            // Whatever ended the pause left frames behind: they come first.
+            self.backlog_bytes += f.encoded_len();
+            self.backlog.push_back(f);
+            self.drain_backlog(now);
+            return;
+        }
         self.on_frame_via(f, now, false);
     }
 
@@ -1908,7 +1924,7 @@ impl Core {
             Phase::Open if self.pending.is_some() => return self.keepalive_paused(now),
             Phase::Open => {}
         }
-        let next_ping = self.expire_pings(now);
+        let next_ping = self.expire_pings(now, false);
         let wait = self.keepalive(now);
         match next_ping {
             Some(d) if self.phase == Phase::Open => wait.min(d.saturating_duration_since(now)),
@@ -1920,7 +1936,9 @@ impl Core {
     /// unanswered. Ours still go out on time, so the peer hears from this side and doesn't take it
     /// for dead. Their PONGs are read once input runs again.
     fn keepalive_paused(&mut self, now: Instant) -> Duration {
-        let poll = Duration::from_millis(100);
+        // Datagrams are still read, so their probes still expire.
+        let next_ping = self.expire_pings(now, true);
+        let poll = next_ping.map_or(Duration::from_millis(100), |d| d.saturating_duration_since(now).min(Duration::from_millis(100)));
         if self.ping_interval == 0 {
             return poll;
         }
@@ -1989,8 +2007,14 @@ impl Core {
     }
 
     /// Ends pings past their deadline, as lost. Returns the next deadline.
-    fn expire_pings(&mut self, now: Instant) -> Option<Instant> {
-        let expired: Vec<u32> = self.pings.iter().filter(|(_, p)| p.deadline.is_some_and(|d| d <= now)).map(|(t, _)| *t).collect();
+    fn expire_pings(&mut self, now: Instant, only_datagrams: bool) -> Option<Instant> {
+        let on_datagrams = |p: &PendingPing| self.channels.get(&p.channel).is_some_and(|c| c.datagram);
+        let expired: Vec<u32> = self
+            .pings
+            .iter()
+            .filter(|(_, p)| p.deadline.is_some_and(|d| d <= now) && (!only_datagrams || on_datagrams(p)))
+            .map(|(t, _)| *t)
+            .collect();
         for t in expired {
             let mut p = self.pings.remove(&t).expect("present");
             if p.channel == 0 {
@@ -2006,7 +2030,7 @@ impl Core {
                 let _ = w.send(Err(Error::Timeout));
             }
         }
-        self.pings.values().filter_map(|p| p.deadline).min()
+        self.pings.values().filter(|p| !only_datagrams || self.channels.get(&p.channel).is_some_and(|c| c.datagram)).filter_map(|p| p.deadline).min()
     }
 
     fn new_token(&self, now: Instant) -> u32 {
@@ -3375,5 +3399,67 @@ mod backlog_tests {
         assert_eq!(serde_json::from_slice::<Value>(&f.payload).unwrap()["code"], code::RATE_LIMITED);
         c.transport_closed();
         assert!(c.backlog.is_empty() && c.backlog_bytes == 0);
+    }
+
+    fn ctl(ty: u8, v: Value) -> Frame {
+        Frame::new(0, ty, 0, serde_json::to_vec(&v).unwrap())
+    }
+
+    fn drain(c: &mut Core) -> Vec<Frame> {
+        let (mut out, mut done) = (Vec::new(), Vec::new());
+        while let Some(f) = c.next_frame(&mut done) {
+            out.push(f);
+        }
+        out
+    }
+
+    fn open(id: u16, quic: Option<&str>) -> Frame {
+        let mut body = json!({ "id": id, "name": "x", "reliable": quic.is_none(), "ordered": quic.is_none() });
+        if let Some(q) = quic {
+            body["quic"] = json!(q);
+        }
+        ctl(ctl::OPEN_CHANNEL, body)
+    }
+
+    /// A local close drops the decision. The peer's CLOSE that waited behind it must still be read,
+    /// or the exchange only ends by timeout.
+    #[test]
+    fn a_peer_close_kept_while_deciding_still_ends_the_exchange() {
+        let now = Instant::now();
+        let policy: Policy = Arc::new(|_| Ok(()));
+        let mut c = Core::new(Role::Server, Options::default(), Some(policy), None, now).unwrap();
+        c.on_frame(ctl(ctl::HELLO, json!({ "version": PROTOCOL_VERSION })), now);
+        drain(&mut c);
+        c.on_frame(open(1, None), now);
+        c.on_frame(ctl(ctl::CLOSE, json!({ "code": 1000 })), now);
+        let a = c.take_ask().unwrap();
+        c.close(code::NORMAL, "", now);
+        c.close_write_done(now);
+        c.decided(a.id(), Ok(()), now);
+        assert!(c.is_done(), "the peer's CLOSE finished the exchange");
+    }
+
+    /// Datagrams are still read while the base path waits, so their probes still time out.
+    #[test]
+    fn datagram_pings_expire_while_deciding() {
+        let now = Instant::now();
+        let policy: Policy = Arc::new(|_| Ok(()));
+        let opts = Options { extensions: vec![QUIC_MULTISTREAM.into()], max_datagram: Some(1200), ping_interval: 0, ..Options::default() };
+        let mut c = Core::new(Role::Server, opts, Some(policy), None, now).unwrap();
+        c.on_frame(ctl(ctl::HELLO, json!({ "version": PROTOCOL_VERSION, "extensions": [QUIC_MULTISTREAM] })), now);
+        c.on_frame(open(1, Some("datagram")), now);
+        c.run_decisions(now);
+        drain(&mut c);
+        let sig = c.channels[&1].sig.clone();
+        assert!(c.channels[&1].datagram);
+        let mut rx = c.ping(Some((1, &sig)), now).unwrap();
+        c.on_frame(open(3, None), now);
+        assert!(c.is_deciding());
+        let later = now + Duration::from_secs(30);
+        c.tick(later);
+        assert!(matches!(rx.try_recv(), Ok(Err(Error::Timeout))), "the datagram ping should have expired");
+        // The pause doesn't push back what already expired, and the base path resumes.
+        c.run_decisions(later);
+        assert!(!c.is_deciding());
     }
 }
