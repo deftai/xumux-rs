@@ -33,6 +33,16 @@ fn io(e: impl std::fmt::Display) -> Error {
     Error::Io(e.to_string())
 }
 
+/// Ends the WebTransport session once the xumux connection has ended. Installed before the
+/// handshake, so a cancelled one still ends it, and holds no handle, so it doesn't keep it open.
+fn close_with(session: &Session, conn: Connection) {
+    let ended = session.on_end();
+    tokio::spawn(async move {
+        ended.await;
+        conn.close(VarInt::from_u32(0), b"");
+    });
+}
+
 /// Runs the server side on an accepted WebTransport session.
 pub async fn accept(conn: Connection, mut opts: Options, acceptor: Acceptor) -> Result<Session> {
     opts.max_datagram = conn.max_datagram_size();
@@ -51,12 +61,8 @@ pub async fn accept(conn: Connection, mut opts: Options, acceptor: Acceptor) -> 
     });
     let core = Core::new(Role::Server, opts, acceptor.policy, acceptor.authorize, Instant::now())?;
     let session = Session::spawn_quic(core, recv, send, Datagrams(conn.clone()));
+    close_with(&session, conn.clone());
     session.finish_handshake_pub().await.inspect_err(|_| conn.close(VarInt::from_u32(0), b""))?;
-    let s = session.clone();
-    tokio::spawn(async move {
-        s.closed().await;
-        conn.close(VarInt::from_u32(0), b"");
-    });
     Ok(session)
 }
 
@@ -71,11 +77,7 @@ pub async fn connect(conn: Connection, mut opts: Options, acceptor: Acceptor) ->
     let mut core = Core::new(Role::Client, opts, acceptor.policy, acceptor.authorize, now)?;
     core.start_client(&[], now)?;
     let session = Session::spawn_quic(core, recv, send, Datagrams(conn.clone()));
+    close_with(&session, conn.clone());
     session.finish_handshake_pub().await.inspect_err(|_| conn.close(VarInt::from_u32(0), b""))?;
-    let s = session.clone();
-    tokio::spawn(async move {
-        s.closed().await;
-        conn.close(VarInt::from_u32(0), b"");
-    });
     Ok(session)
 }

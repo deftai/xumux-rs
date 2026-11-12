@@ -44,11 +44,12 @@ fn io(e: impl std::fmt::Display) -> Error {
     Error::Io(e.to_string())
 }
 
-/// Ends the QUIC connection once the xumux connection has ended.
+/// Ends the QUIC connection once the xumux connection has ended. Holds no handle, so it doesn't keep
+/// the connection open.
 fn close_with(session: &Session, conn: quinn::Connection) {
-    let s = session.clone();
+    let ended = session.on_end();
     tokio::spawn(async move {
-        s.closed().await;
+        ended.await;
         conn.close(0u32.into(), b"");
     });
 }
@@ -71,8 +72,9 @@ pub async fn accept(conn: quinn::Connection, mut opts: Options, acceptor: Accept
     });
     let core = Core::new(Role::Server, opts, acceptor.policy, acceptor.authorize, Instant::now())?;
     let session = Session::spawn_quic(core, recv, send, Datagrams(conn.clone()));
+    // Before the handshake, so a cancelled one still ends the QUIC connection.
+    close_with(&session, conn.clone());
     session.finish_handshake_pub().await.inspect_err(|_| conn.close(0u32.into(), b""))?;
-    close_with(&session, conn);
     Ok(session)
 }
 
@@ -89,8 +91,9 @@ pub async fn connect(conn: quinn::Connection, mut opts: Options, acceptor: Accep
     let opened = core.start_client(&channels, now)?;
     let waits: Vec<_> = opened.iter().map(|(id, sig)| (*id, sig.clone(), core.hello_channel_waiter(*id).expect("just inserted"))).collect();
     let session = Session::spawn_quic(core, recv, send, Datagrams(conn.clone()));
+    // Before the handshake, so a cancelled one still ends the QUIC connection.
+    close_with(&session, conn.clone());
     session.finish_handshake_pub().await.inspect_err(|_| conn.close(0u32.into(), b""))?;
-    close_with(&session, conn);
-    let out = session.channels_from_hello(waits, channels).await;
+    let out = session.hello_channels(waits, channels).await;
     Ok((session, out))
 }

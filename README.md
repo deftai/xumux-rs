@@ -34,7 +34,13 @@ channel.send(0x01, Bytes::from_static(b"hello")).await?;
 let reply = channel.receive().await?;
 ```
 
-A server passes `Acceptor::default().policy(|spec| ...)` to `Session::accept`, then takes channels from `session.accept_channel()`.
+A server passes `Acceptor::default().policy(|spec| ...)` to `Session::accept`, then takes channels from `session.accept_channel()`. The policy and `authorize` callbacks run on tokio's blocking pool, outside the session's lock, so a slow one delays only the frames that arrive after the one it is deciding. Keepalive doesn't count that wait against the peer, and keeps sending its PINGs so the peer doesn't count it against this side. A callback that panics refuses: the channel with 4010, the HELLO with 4000.
+
+Handles close what they refer to when dropped:
+
+- When the last clone of a `Channel` is dropped, including one inside a `Pipe`, the channel closes with 1000, as `close(1000, None)` would, but without waiting for the answer. Messages not yet sent are discarded. A `Channel` dropped while it is still opening, for example by cancelling `open_channel`, is closed as soon as the peer accepts it.
+- When the last clone of a `Session` and the last `Channel` on it are gone, the connection closes with 1001 (GOING_AWAY). A live channel keeps its session open. Keep a handle for as long as the connection should stay up, or call `Session::close` to end it with another code and wait for the exchange.
+- Dropping a `send` future doesn't take the message back: it is queued before the first wait, and still goes out.
 
 For latency-sensitive traffic, call `Channel::set_priority` (lower goes first) and `transport::tune_tcp` on TCP sockets. Video senders can use `send_credit`, `queued` and `queue` to decide what to drop before it is encoded.
 
