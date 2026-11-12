@@ -815,7 +815,10 @@ impl Core {
         }
         self.remote = remote;
         self.hello = Some(o);
-        let accepted_ext: Vec<String> = extensions.into_iter().filter(|e| self.opts.extensions.contains(e)).collect();
+        // Each once: a HELLO that repeats one could otherwise make WELCOME too large to send.
+        let ours: BTreeSet<&String> = self.opts.extensions.iter().collect();
+        let mut seen = BTreeSet::new();
+        let accepted_ext: Vec<String> = extensions.into_iter().filter(|e| ours.contains(e) && seen.insert(e.clone())).collect();
         self.multistream = accepted_ext.iter().any(|e| e == QUIC_MULTISTREAM) && self.opts.max_datagram.is_some();
 
         let mut accepted = Vec::new();
@@ -848,7 +851,11 @@ impl Core {
             "channels": accepted,
             "rejected": rejected,
         });
-        let welcome = self.fit_welcome(welcome);
+        let Some(welcome) = self.fit_welcome(welcome) else {
+            // What is left is the accepted extensions, which no channel refusal can shrink.
+            self.accepted.clear();
+            return Err(Refusal::new(code::GOING_AWAY, "WELCOME does not fit in a control payload"));
+        };
         self.queue_ctrl(ctl::WELCOME, &welcome, now);
         self.ping_interval = self.opts.ping_interval.min(MAX_PING_SECS);
         self.ping_timeout = self.opts.ping_timeout.min(MAX_PING_SECS);
@@ -867,12 +874,13 @@ impl Core {
     /// can be longer than the request it answers: a refusal with a reason, or a datagram placement.
     /// Following core §5.2, refusals lose their reasons first. If that is not enough, accepted
     /// channels are refused with 4002 and no reason, from the last, as if past the channel limit.
-    fn fit_welcome(&mut self, mut welcome: Value) -> Value {
+    /// None if even that is not enough.
+    fn fit_welcome(&mut self, mut welcome: Value) -> Option<Value> {
         let size = |v: &Value| serde_json::to_vec(v).expect("JSON encodes").len();
         let max = CONTROL_MAX as usize;
         let mut len = size(&welcome);
         if len <= max {
-            return welcome;
+            return Some(welcome);
         }
         for r in welcome["rejected"].as_array_mut().expect("built by handle_hello") {
             r.as_object_mut().expect("built by handle_hello").remove("reason");
@@ -895,7 +903,7 @@ impl Core {
         }
         debug_assert_eq!(len, size(&welcome));
         self.accepted.retain(|a| !refused.contains(&a.id));
-        welcome
+        (len <= max).then_some(welcome)
     }
 
     fn on_welcome(&mut self, payload: &[u8], now: Instant) {
@@ -2854,6 +2862,35 @@ mod hygiene_tests {
             handed += 1;
         }
         assert_eq!(handed, accepted.len());
+    }
+
+    #[test]
+    fn a_repeated_extension_is_accepted_once() {
+        let opts = Options { max_datagram: Some(1200), extensions: vec![QUIC_MULTISTREAM.into()], ..Options::default() };
+        let hello = json!({ "version": PROTOCOL_VERSION, "extensions": vec![QUIC_MULTISTREAM; 3113] });
+        let (c, welcome) = welcome_for(opts, None, &hello);
+        let w: Value = serde_json::from_slice(&welcome.payload).unwrap();
+        assert_eq!(w["extensions"], json!([QUIC_MULTISTREAM]));
+        assert!(c.is_open());
+    }
+
+    #[test]
+    fn a_welcome_that_cannot_fit_refuses_the_connection() {
+        // The server accepts every one of thousands of distinct extensions, and WELCOME's own
+        // fields push their echo over the limit.
+        let names: Vec<String> = (0..7000).map(|i| format!("e{i:05}/1")).collect();
+        let mut hello = json!({ "version": PROTOCOL_VERSION, "extensions": &names });
+        // Each name is 11 bytes with its comma: drop just enough for HELLO to fit.
+        let excess = serde_json::to_vec(&hello).unwrap().len() - CONTROL_MAX as usize;
+        let keep = names.len() - excess.div_ceil(11);
+        hello["extensions"].as_array_mut().unwrap().truncate(keep);
+        assert!((CONTROL_MAX as usize - 11..=CONTROL_MAX as usize).contains(&serde_json::to_vec(&hello).unwrap().len()));
+        let now = Instant::now();
+        let mut c = Core::new(Role::Server, Options { extensions: names, ..Options::default() }, None, None, now).unwrap();
+        c.on_frame(ctl_frame(ctl::HELLO, hello), now);
+        let frames = drain(&mut c);
+        assert!(frames.iter().all(|f| f.ty != ctl::WELCOME && f.payload.len() <= CONTROL_MAX as usize));
+        assert_eq!(close_code(&frames), Some(u64::from(code::GOING_AWAY)));
     }
 
     // 4: a CLOSE body is checked like any control payload (core §4.1, §9.1).
