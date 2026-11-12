@@ -3030,6 +3030,7 @@ mod hygiene_tests {
         let hello = ctl_frame(ctl::HELLO, hello.clone());
         assert!(hello.payload.len() <= CONTROL_MAX as usize, "the HELLO itself must fit");
         c.on_frame(hello, now);
+        c.run_decisions(now);
         let welcome = drain(&mut c).into_iter().find(|f| f.ty == ctl::WELCOME).expect("WELCOME");
         (c, welcome)
     }

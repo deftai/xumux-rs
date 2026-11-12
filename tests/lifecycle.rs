@@ -198,3 +198,13 @@ async fn a_slow_policy_is_not_mistaken_for_a_silent_peer() {
     assert!(s.close_info().is_none(), "closed with {:?}", s.close_info());
     assert!(s.ping().await.is_ok());
 }
+
+/// A channel the peer opened but nobody took yet ends with the connection, and is not handed out.
+#[tokio::test]
+async fn accept_channel_never_returns_a_channel_that_has_ended() {
+    let (s, c) = pair().await;
+    let _ch = c.open_channel(ChannelSpec::reliable("x")).await.unwrap();
+    c.close(code::NORMAL, "").await;
+    tokio::time::timeout(SHORT, s.closed()).await.unwrap();
+    assert!(s.accept_channel().await.is_none());
+}
