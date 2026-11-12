@@ -86,7 +86,7 @@ pub async fn connect(conn: quinn::Connection, mut opts: Options, acceptor: Accep
     let (send, recv) = conn.open_bi().await.map_err(io)?;
     let now = Instant::now();
     let mut core = Core::new(Role::Client, opts, acceptor.policy, acceptor.authorize, now)?;
-    let opened = core.start_client(&channels, now);
+    let opened = core.start_client(&channels, now)?;
     let waits: Vec<_> = opened.iter().map(|(id, sig)| (*id, sig.clone(), core.hello_channel_waiter(*id).expect("just inserted"))).collect();
     let session = Session::spawn_quic(core, recv, send, Datagrams(conn.clone()));
     session.finish_handshake_pub().await.inspect_err(|_| conn.close(0u32.into(), b""))?;

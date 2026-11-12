@@ -106,7 +106,7 @@ impl Session {
     {
         let now = Instant::now();
         let mut core = Core::new(Role::Client, opts, acceptor.policy, acceptor.authorize, now)?;
-        let opened = core.start_client(&channels, now);
+        let opened = core.start_client(&channels, now)?;
         let waits: Vec<_> = opened
             .iter()
             .map(|(id, sig)| (*id, sig.clone(), core.hello_channel_waiter(*id).expect("just inserted")))
@@ -181,7 +181,7 @@ impl Session {
     ) -> Result<(Session, Vec<Result<Channel>>)> {
         let now = Instant::now();
         let mut core = Core::new(Role::Client, opts, acceptor.policy, acceptor.authorize, now)?;
-        let opened = core.start_client(&channels, now);
+        let opened = core.start_client(&channels, now)?;
         let waits: Vec<_> = opened
             .iter()
             .map(|(id, sig)| (*id, sig.clone(), core.hello_channel_waiter(*id).expect("just inserted")))
@@ -289,6 +289,8 @@ impl Session {
     pub async fn ping(&self) -> Result<Duration> {
         let rx = self.shared.lock().ping(None, Instant::now())?;
         self.shared.wake_writer.notify_one();
+        // The ping has a deadline the timer may be sleeping past.
+        self.shared.wake_timer.notify_one();
         rx.await.unwrap_or_else(|_| Err(self.closed_error()))
     }
 
@@ -747,6 +749,9 @@ impl Channel {
             let r = {
                 let mut core = self.core();
                 let r = core.receive(self.id, &self.sig, Instant::now());
+                if core.take_timer_kick() {
+                    self.session.shared.wake_timer.notify_one(); // A window-growth probe went out.
+                }
                 if r.is_none() && core.is_ended() {
                     Some(Ok(None))
                 } else {
@@ -775,13 +780,20 @@ impl Channel {
     }
 
     pub fn return_credit(&self, n: usize) {
-        self.core().return_credit(self.id, &self.sig, n as u64, Instant::now());
+        {
+            let mut core = self.core();
+            core.return_credit(self.id, &self.sig, n as u64, Instant::now());
+            if core.take_timer_kick() {
+                self.session.shared.wake_timer.notify_one(); // A window-growth probe went out.
+            }
+        }
         self.wake();
     }
 
     pub async fn ping(&self) -> Result<Duration> {
         let rx = self.core().ping(Some((self.id, &self.sig)), Instant::now())?;
         self.wake();
+        self.session.shared.wake_timer.notify_one(); // For the ping's deadline.
         rx.await.unwrap_or_else(|_| Err(self.session.closed_error()))
     }
 

@@ -69,9 +69,12 @@ impl Pipe {
             }
             RESET => {
                 let v: Value = serde_json::from_slice(&m.payload).unwrap_or(Value::Null);
-                let info = CloseInfo {
-                    code: v["code"].as_u64().unwrap_or(u64::from(code::GOING_AWAY)) as u16,
-                    reason: v["reason"].as_str().unwrap_or("").to_owned(),
+                let reason = v["reason"].as_str().unwrap_or("").to_owned();
+                // Still a RESET, so the channel closes with 1001 as pipe/1 says, but a code wider
+                // than 16 bits is reported as invalid rather than cast down (66536 would read as 1000).
+                let info = match u16::try_from(v["code"].as_u64().unwrap_or(u64::from(code::GOING_AWAY))) {
+                    Ok(c) => CloseInfo { code: c, reason },
+                    Err(_) => CloseInfo { code: code::INVALID_MESSAGE, reason: "RESET code out of range".into() },
                 };
                 self.ch.close(code::GOING_AWAY, None).await;
                 Err(Error::ChannelClosed(info))

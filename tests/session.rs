@@ -234,6 +234,19 @@ async fn a_pipe_carries_bytes_with_half_close_and_backpressure() {
 }
 
 #[tokio::test]
+async fn a_pipe_reset_code_above_16_bits_is_not_truncated() {
+    let (s, c) = pair().await;
+    let a = Pipe::new(c.open_channel(pipe::spec("p", None)).await.unwrap()).unwrap();
+    let b = Pipe::new(s.accept_channel().await.unwrap()).unwrap();
+    // 66536 as u16 is 1000, which would read as a normal close.
+    a.channel().send(pipe::RESET, br#"{"code":66536}"#.to_vec()).await.unwrap();
+    match b.read().await {
+        Err(Error::ChannelClosed(info)) => assert_eq!(info.code, code::INVALID_MESSAGE),
+        other => panic!("expected ChannelClosed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn hello_channels_are_opened_or_refused_in_order() {
     let (a, b) = duplex(1 << 16);
     let (ar, aw) = split(a);
