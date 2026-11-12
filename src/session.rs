@@ -655,7 +655,8 @@ impl Channel {
     /// Queues a message without waiting for it to be sent. For senders with their own pacing, such
     /// as video, which checks [`Channel::send_credit`] and [`Channel::queued`] first.
     pub fn queue(&self, ty: u8, payload: impl Into<Bytes>) -> Result<()> {
-        let _ = self.core().send(self.id, &self.sig, ty, payload.into())?;
+        // The completion receiver isn't needed: a queued message reports nothing back.
+        drop(self.core().send(self.id, &self.sig, ty, payload.into())?);
         self.wake();
         Ok(())
     }
