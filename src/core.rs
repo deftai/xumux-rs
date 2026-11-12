@@ -61,7 +61,10 @@ pub struct Options {
     /// Fragment size on a shared path, for fair interleaving (core §7).
     pub fragment_size: u32,
     /// How far a channel's receive window may grow. Windows don't grow at or below `initial_window`.
+    /// Values above 2^31-1, the most credit a peer may hold (core §6), are clamped to it.
     pub max_channel_window: u64,
+    /// No window grows past the point where all of them together would exceed this. It is a total,
+    /// not one peer's credit, so the 2^31-1 bound doesn't apply.
     pub connection_window: u64,
     pub max_control_queue: usize,
     /// Most bytes handed to the transport at once. Smaller lets a high-priority channel overtake
@@ -445,10 +448,13 @@ fn limits_from(o: &Map<String, Value>) -> std::result::Result<Limits, Refusal> {
 }
 
 impl Core {
-    pub fn new(role: Role, opts: Options, policy: Option<Policy>, authorize: Option<Authorize>, now: Instant) -> Result<Core> {
+    pub fn new(role: Role, mut opts: Options, policy: Option<Policy>, authorize: Option<Authorize>, now: Instant) -> Result<Core> {
         if !opts.limits.valid() {
             return Err(Error::Invalid("declared limits are out of bounds"));
         }
+        // A larger window would let growth grant the peer more than the 2^31-1 credit it may hold
+        // (core §6), which the peer must close with 4009.
+        opts.max_channel_window = opts.max_channel_window.min(MAX_CREDIT);
         Ok(Core {
             role,
             phase: Phase::Handshake,
@@ -521,6 +527,11 @@ impl Core {
 
     pub fn write_batch(&self) -> usize {
         self.opts.write_batch.max(1)
+    }
+
+    /// How long to wait for the peer's CLOSE (core §9.1), and so for the transport to end after it.
+    pub fn close_timeout(&self) -> Duration {
+        self.opts.close_timeout
     }
 
     pub fn remote_limits(&self) -> Limits {
@@ -701,16 +712,8 @@ impl Core {
         if channels.len() > usize::from(RESERVED_CHANNEL / 2) {
             return Err(Error::Invalid("too many channels for HELLO"));
         }
-        let mut out = Vec::new();
-        let mut reqs = Vec::new();
-        let mut id = 1u16;
-        for spec in channels {
-            let sig = self.insert_channel(id, ChanState::Opening, now);
-            self.channels.get_mut(&id).expect("present").asked_datagram = spec.quic.as_deref() == Some("datagram");
-            reqs.push(spec.to_json(id));
-            out.push((id, sig));
-            id += 2;
-        }
+        let ids = (1..RESERVED_CHANNEL).step_by(2);
+        let reqs: Vec<Value> = channels.iter().zip(ids.clone()).map(|(spec, id)| spec.to_json(id)).collect();
         let l = self.opts.limits;
         let mut hello = json!({
             "version": PROTOCOL_VERSION,
@@ -730,7 +733,19 @@ impl Core {
         if !self.opts.extensions.is_empty() {
             hello["extensions"] = json!(self.opts.extensions);
         }
-        self.queue_ctrl(ctl::HELLO, &hello, now);
+        // core §3.1: HELLO MUST NOT exceed the 65536-byte channel-0 limit. Checked before any
+        // channel exists, so a refusal leaves nothing half open.
+        let payload = serde_json::to_vec(&hello).expect("JSON encodes");
+        if payload.len() > CONTROL_MAX as usize {
+            return Err(Error::Invalid("HELLO is larger than a control payload may be"));
+        }
+        let mut out = Vec::with_capacity(channels.len());
+        for (spec, id) in channels.iter().zip(ids) {
+            let sig = self.insert_channel(id, ChanState::Opening, now);
+            self.channels.get_mut(&id).expect("present").asked_datagram = spec.quic.as_deref() == Some("datagram");
+            out.push((id, sig));
+        }
+        self.queue_ctrl_frame(Frame::new(0, ctl::HELLO, 0, Bytes::from(payload)), now);
         Ok(out)
     }
 
@@ -800,7 +815,10 @@ impl Core {
         }
         self.remote = remote;
         self.hello = Some(o);
-        let accepted_ext: Vec<String> = extensions.into_iter().filter(|e| self.opts.extensions.contains(e)).collect();
+        // Each once: a HELLO that repeats one could otherwise make WELCOME too large to send.
+        let ours: BTreeSet<&String> = self.opts.extensions.iter().collect();
+        let mut seen = BTreeSet::new();
+        let accepted_ext: Vec<String> = extensions.into_iter().filter(|e| ours.contains(e) && seen.insert(e.clone())).collect();
         self.multistream = accepted_ext.iter().any(|e| e == QUIC_MULTISTREAM) && self.opts.max_datagram.is_some();
 
         let mut accepted = Vec::new();
@@ -833,6 +851,11 @@ impl Core {
             "channels": accepted,
             "rejected": rejected,
         });
+        let Some(welcome) = self.fit_welcome(welcome) else {
+            // What is left is the accepted extensions, which no channel refusal can shrink.
+            self.accepted.clear();
+            return Err(Refusal::new(code::GOING_AWAY, "WELCOME does not fit in a control payload"));
+        };
         self.queue_ctrl(ctl::WELCOME, &welcome, now);
         self.ping_interval = self.opts.ping_interval.min(MAX_PING_SECS);
         self.ping_timeout = self.opts.ping_timeout.min(MAX_PING_SECS);
@@ -845,6 +868,44 @@ impl Core {
         self.handshake_done.notify_waiters();
         self.wake_accept.notify_waiters();
         Ok(())
+    }
+
+    /// WELCOME, like any channel-0 payload, MUST NOT exceed 65536 bytes (core §3.1), but an answer
+    /// can be longer than the request it answers: a refusal with a reason, or a datagram placement.
+    /// Following core §5.2, refusals lose their reasons first. If that is not enough, accepted
+    /// channels are refused with 4002 and no reason, from the last, as if past the channel limit.
+    /// None if even that is not enough.
+    fn fit_welcome(&mut self, mut welcome: Value) -> Option<Value> {
+        let size = |v: &Value| serde_json::to_vec(v).expect("JSON encodes").len();
+        let max = CONTROL_MAX as usize;
+        let mut len = size(&welcome);
+        if len <= max {
+            return Some(welcome);
+        }
+        for r in welcome["rejected"].as_array_mut().expect("built by handle_hello") {
+            r.as_object_mut().expect("built by handle_hello").remove("reason");
+        }
+        len = size(&welcome);
+        let mut refused = BTreeSet::new();
+        while len > max {
+            let Some(a) = welcome["channels"].as_array_mut().expect("built by handle_hello").pop() else { break };
+            let id = a["id"].as_u64().and_then(|i| u16::try_from(i).ok()).expect("built by handle_hello");
+            let r = json!({ "id": id, "code": code::CHANNEL_LIMIT });
+            let rejected = welcome["rejected"].as_array_mut().expect("built by handle_hello");
+            // A comma separates each entry from the one before it.
+            len += size(&r) + usize::from(!rejected.is_empty());
+            rejected.push(r);
+            len -= size(&a) + usize::from(!welcome["channels"].as_array().expect("built by handle_hello").is_empty());
+            refused.insert(id);
+            if let Some(ch) = self.channels.remove(&id) {
+                self.total_window -= ch.window;
+            }
+        }
+        // The running count only picks how many to refuse; what is sent is checked in full.
+        let final_len = size(&welcome);
+        debug_assert_eq!(len, final_len);
+        self.accepted.retain(|a| !refused.contains(&a.id));
+        (final_len <= max).then_some(welcome)
     }
 
     fn on_welcome(&mut self, payload: &[u8], now: Instant) {
@@ -860,7 +921,17 @@ impl Core {
             return Err(Refusal::new(code::VERSION_MISMATCH, "unsupported version"));
         }
         self.remote = limits_from(&o)?;
-        self.multistream = o.get("extensions").and_then(Value::as_array).is_some_and(|a| a.iter().any(|e| e == QUIC_MULTISTREAM));
+        let extensions = match o.get("extensions") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(a)) => a.iter().map(|v| v.as_str().ok_or_else(|| Refusal::new(code::INVALID_MESSAGE, "extensions must be strings"))).collect::<std::result::Result<Vec<_>, _>>()?,
+            _ => return Err(Refusal::new(code::INVALID_MESSAGE, "extensions must be an array")),
+        };
+        // core §3.3: accepted extensions "MUST be a subset of the client's list". No action is
+        // given, so the §4.1 catch-all applies: 1002.
+        if extensions.iter().any(|e| !self.opts.extensions.iter().any(|ours| ours == e)) {
+            return Err(Refusal::new(code::PROTOCOL_ERROR, "WELCOME accepts an extension that HELLO did not offer"));
+        }
+        self.multistream = extensions.contains(&QUIC_MULTISTREAM);
         if let Some(v) = opt_int(&o, "pingInterval")? {
             self.ping_interval = v.min(MAX_PING_SECS);
         }
@@ -1389,12 +1460,12 @@ impl Core {
     }
 
     fn on_close(&mut self, payload: &[u8], now: Instant) {
-        let (c, reason) = match parse_object(payload) {
-            Ok(o) => match close_code(o.get("code").and_then(Value::as_u64).unwrap_or(u64::from(code::PROTOCOL_ERROR))) {
-                Ok(c) => (c, o.get("reason").and_then(Value::as_str).unwrap_or("").to_owned()),
-                Err(r) => (r.code, "CLOSE code out of range".to_owned()),
-            },
-            Err(_) => (code::INVALID_MESSAGE, "malformed CLOSE".to_owned()),
+        // CLOSE is `{code, reason?}` (core §9.1). A missing or mistyped field is 4001 (core §4.1),
+        // as is a code out of range; either way the connection still ends.
+        let parsed = parse_object(payload).and_then(|o| Ok((close_code(int_field(&o, "code")?)?, opt_str(&o, "reason")?.unwrap_or_default())));
+        let (c, reason) = match parsed {
+            Ok(v) => v,
+            Err(r) => (r.code, format!("malformed CLOSE: {}", r.reason)),
         };
         self.close_info.get_or_insert(CloseInfo { code: c, reason: reason.clone() });
         match self.phase {
@@ -1525,7 +1596,24 @@ impl Core {
         self.queue_ctrl(ctl::CLOSE_CHANNEL, &body, now);
         if let Some(ch) = self.channels.get_mut(&id) {
             ch.sent_close = true;
+            // A closing channel discards received probes (core §8.1), so no PONG can answer its
+            // pings now: end them rather than leave them to time out.
+            let info = ch.close_info.clone().unwrap_or(CloseInfo { code: c, reason: reason.unwrap_or("").to_owned() });
+            self.end_pings(id, &info);
         }
+    }
+
+    /// Ends a channel's pending pings, failing their waiters with `ChannelClosed`.
+    fn end_pings(&mut self, id: u16, info: &CloseInfo) {
+        self.pings.retain(|_, p| {
+            if p.channel != id {
+                return true;
+            }
+            if let Some(w) = p.waiter.take() {
+                let _ = w.send(Err(Error::ChannelClosed(info.clone())));
+            }
+            false
+        });
     }
 
     /// A channel-level error: core §7.
@@ -1553,15 +1641,7 @@ impl Core {
         }
         let info = ch.close_info.clone().unwrap_or(CloseInfo { code: code::NORMAL, reason: String::new() });
         // Its PONGs can no longer arrive, and the ID may be reused.
-        self.pings.retain(|_, p| {
-            if p.channel != id {
-                return true;
-            }
-            if let Some(w) = p.waiter.take() {
-                let _ = w.send(Err(Error::ChannelClosed(info.clone())));
-            }
-            false
-        });
+        self.end_pings(id, &info);
         *ch.sig.finished.lock().unwrap() = Some(Finished { recv: std::mem::take(&mut ch.recv), info, stats: ch.stats });
         ch.sig.recv.notify_waiters();
         ch.sig.closed.notify_waiters();
@@ -2618,9 +2698,239 @@ mod correctness_tests {
         let specs = vec![ChannelSpec::reliable("a"); 32768];
         assert!(matches!(c.start_client(&specs, now), Err(Error::Invalid(_))));
         assert!(c.channels.is_empty());
-        // The most there are odd IDs for still works.
+        // As many as there are odd IDs for can't fit in a HELLO either, and are refused for that.
         let mut c = Core::new(Role::Client, Options::default(), None, None, now).unwrap();
-        let opened = c.start_client(&specs[..32767], now).unwrap();
-        assert_eq!(opened.last().unwrap().0, RESERVED_CHANNEL - 2);
+        assert!(matches!(c.start_client(&specs[..32767], now), Err(Error::Invalid(_))));
+        assert!(c.channels.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod hygiene_tests {
+    use super::*;
+
+    fn drain(c: &mut Core) -> Vec<Frame> {
+        let (mut out, mut done) = (Vec::new(), Vec::new());
+        while let Some(f) = c.next_frame(&mut done) {
+            out.push(f);
+        }
+        out
+    }
+
+    fn ctl_frame(ty: u8, v: Value) -> Frame {
+        Frame::new(0, ty, 0, serde_json::to_vec(&v).unwrap())
+    }
+
+    fn close_code(frames: &[Frame]) -> Option<u64> {
+        frames.iter().find(|f| f.channel == 0 && f.ty == ctl::CLOSE).map(|f| serde_json::from_slice::<Value>(&f.payload).unwrap()["code"].as_u64().unwrap())
+    }
+
+    fn client(opts: Options) -> Core {
+        let now = Instant::now();
+        let mut c = Core::new(Role::Client, opts, None, None, now).unwrap();
+        c.start_client(&[], now).unwrap();
+        drain(&mut c);
+        c
+    }
+
+    fn welcomed(opts: Options) -> Core {
+        let mut c = client(opts);
+        c.on_frame(ctl_frame(ctl::WELCOME, json!({ "version": PROTOCOL_VERSION })), Instant::now());
+        assert!(c.is_open());
+        c
+    }
+
+    fn open_channel(c: &mut Core, now: Instant) -> (u16, Arc<Signals>) {
+        let (id, sig, _rx) = c.open_channel(ChannelSpec::reliable("x"), now).unwrap();
+        c.on_frame(ctl_frame(ctl::CHANNEL_ACK, json!({ "id": id, "reliable": true, "ordered": true })), now);
+        drain(c);
+        (id, sig)
+    }
+
+    /// A server that has answered `hello`, and the WELCOME it wrote.
+    fn welcome_for(opts: Options, policy: Option<Policy>, hello: &Value) -> (Core, Frame) {
+        let now = Instant::now();
+        let mut c = Core::new(Role::Server, opts, policy, None, now).unwrap();
+        let hello = ctl_frame(ctl::HELLO, hello.clone());
+        assert!(hello.payload.len() <= CONTROL_MAX as usize, "the HELLO itself must fit");
+        c.on_frame(hello, now);
+        let welcome = drain(&mut c).into_iter().find(|f| f.ty == ctl::WELCOME).expect("WELCOME");
+        (c, welcome)
+    }
+
+    // 1: WELCOME may only accept what HELLO offered (core §3.3).
+    #[test]
+    fn a_welcome_extension_we_did_not_offer_closes_with_1002() {
+        let mut c = client(Options { max_datagram: Some(1200), ..Options::default() });
+        c.on_frame(ctl_frame(ctl::WELCOME, json!({ "version": PROTOCOL_VERSION, "extensions": [QUIC_MULTISTREAM] })), Instant::now());
+        assert!(!c.multistream);
+        assert_eq!(close_code(&drain(&mut c)), Some(u64::from(code::PROTOCOL_ERROR)));
+    }
+
+    #[test]
+    fn welcome_extensions_that_are_not_strings_close_with_4001() {
+        for bad in [json!("quic-multistream/1"), json!([1])] {
+            let mut c = client(Options::default());
+            c.on_frame(ctl_frame(ctl::WELCOME, json!({ "version": PROTOCOL_VERSION, "extensions": bad })), Instant::now());
+            assert_eq!(close_code(&drain(&mut c)), Some(u64::from(code::INVALID_MESSAGE)), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_offered_extension_is_accepted() {
+        let opts = Options { max_datagram: Some(1200), extensions: vec![QUIC_MULTISTREAM.into()], ..Options::default() };
+        let mut c = client(opts);
+        c.on_frame(ctl_frame(ctl::WELCOME, json!({ "version": PROTOCOL_VERSION, "extensions": [QUIC_MULTISTREAM] })), Instant::now());
+        assert!(c.is_open() && c.multistream);
+    }
+
+    // 2: no grant may raise the peer's credit above 2^31-1 (core §6).
+    #[test]
+    fn window_growth_stops_at_the_credit_maximum() {
+        let now = Instant::now();
+        let mut c = welcomed(Options { max_channel_window: u64::MAX, connection_window: u64::MAX, ..Options::default() });
+        let (id, _sig) = open_channel(&mut c, now);
+        c.channels.get_mut(&id).unwrap().stats.srtt = Some(Duration::from_secs(1));
+        for _ in 0..20 {
+            // The peer sends all its credit at once, and the application takes it at once.
+            let ch = c.channels.get_mut(&id).unwrap();
+            let n = std::mem::take(&mut ch.recv_credit);
+            c.consumed(id, n, now);
+            let ch = &c.channels[&id];
+            assert!(ch.recv_credit <= MAX_CREDIT, "the peer holds {} credit", ch.recv_credit);
+        }
+        assert_eq!(c.channels[&id].window, MAX_CREDIT);
+    }
+
+    // 3: HELLO and WELCOME fit in a channel-0 payload (core §3.1, §4).
+    #[test]
+    fn a_hello_over_the_control_limit_is_refused() {
+        let now = Instant::now();
+        let mut c = Core::new(Role::Client, Options::default(), None, None, now).unwrap();
+        let specs = vec![ChannelSpec::reliable("a"); 2000];
+        assert!(matches!(c.start_client(&specs, now), Err(Error::Invalid(_))));
+        assert!(c.channels.is_empty());
+        assert_eq!(c.total_window, 0);
+        assert!(drain(&mut c).is_empty());
+        // Large credentials count too.
+        let opts = Options { auth: Some(json!({ "token": "x".repeat(70_000) })), ..Options::default() };
+        let mut c = Core::new(Role::Client, opts, None, None, now).unwrap();
+        assert!(matches!(c.start_client(&[], now), Err(Error::Invalid(_))));
+        // One that fits goes out.
+        let mut c = Core::new(Role::Client, Options::default(), None, None, now).unwrap();
+        c.start_client(&specs[..1000], now).unwrap();
+        let hello = drain(&mut c);
+        assert_eq!(hello.len(), 1);
+        assert!(hello[0].payload.len() <= CONTROL_MAX as usize);
+    }
+
+    fn hello_with(n: u16, spec: impl Fn(u16) -> Value) -> Value {
+        json!({ "version": PROTOCOL_VERSION, "extensions": [QUIC_MULTISTREAM], "channels": (0..n).map(|i| spec(2 * i + 1)).collect::<Vec<_>>() })
+    }
+
+    #[test]
+    fn long_refusals_lose_their_reasons_to_fit_welcome() {
+        // Each refusal, with the default reason, is longer than the request it answers.
+        let hello = hello_with(1200, |id| json!({ "id": id, "name": "", "reliable": true, "ordered": true }));
+        let (c, welcome) = welcome_for(Options::default(), None, &hello);
+        assert!(welcome.payload.len() <= CONTROL_MAX as usize, "WELCOME is {} bytes", welcome.payload.len());
+        let w: Value = serde_json::from_slice(&welcome.payload).unwrap();
+        let rejected = w["rejected"].as_array().unwrap();
+        assert_eq!(rejected.len(), 1200);
+        assert!(rejected.iter().all(|r| r["code"] == code::UNSUPPORTED));
+        assert!(c.is_open());
+    }
+
+    #[test]
+    fn channels_that_do_not_fit_welcome_are_refused_with_4002() {
+        // A datagram placement's answer is longer than its request.
+        let opts = Options { max_datagram: Some(1200), extensions: vec![QUIC_MULTISTREAM.into()], max_channels: 2000, ..Options::default() };
+        let hello = hello_with(900, |id| json!({ "id": id, "name": "", "reliable": false, "ordered": false, "quic": "datagram" }));
+        let policy: Policy = Arc::new(|_| Ok(()));
+        let (mut c, welcome) = welcome_for(opts, Some(policy), &hello);
+        assert!(welcome.payload.len() <= CONTROL_MAX as usize, "WELCOME is {} bytes", welcome.payload.len());
+        let w: Value = serde_json::from_slice(&welcome.payload).unwrap();
+        let accepted = w["channels"].as_array().unwrap();
+        let rejected = w["rejected"].as_array().unwrap();
+        assert!(!rejected.is_empty());
+        assert_eq!(accepted.len() + rejected.len(), 900);
+        assert!(rejected.iter().all(|r| r["code"] == code::CHANNEL_LIMIT && r.get("reason").is_none()));
+        // Refused channels are not open, and their windows are given back.
+        assert_eq!(c.channels.len(), accepted.len());
+        assert_eq!(c.total_window, accepted.len() as u64 * u64::from(Limits::default().initial_window));
+        let mut handed = 0;
+        while let Some(a) = c.take_accepted() {
+            assert!(c.channels.contains_key(&a.id));
+            handed += 1;
+        }
+        assert_eq!(handed, accepted.len());
+    }
+
+    #[test]
+    fn a_repeated_extension_is_accepted_once() {
+        let opts = Options { max_datagram: Some(1200), extensions: vec![QUIC_MULTISTREAM.into()], ..Options::default() };
+        let hello = json!({ "version": PROTOCOL_VERSION, "extensions": vec![QUIC_MULTISTREAM; 3113] });
+        let (c, welcome) = welcome_for(opts, None, &hello);
+        let w: Value = serde_json::from_slice(&welcome.payload).unwrap();
+        assert_eq!(w["extensions"], json!([QUIC_MULTISTREAM]));
+        assert!(c.is_open());
+    }
+
+    #[test]
+    fn a_welcome_that_cannot_fit_refuses_the_connection() {
+        // The server accepts every one of thousands of distinct extensions, and WELCOME's own
+        // fields push their echo over the limit.
+        let names: Vec<String> = (0..7000).map(|i| format!("e{i:05}/1")).collect();
+        let mut hello = json!({ "version": PROTOCOL_VERSION, "extensions": &names });
+        // Each name is 11 bytes with its comma: drop just enough for HELLO to fit.
+        let excess = serde_json::to_vec(&hello).unwrap().len() - CONTROL_MAX as usize;
+        let keep = names.len() - excess.div_ceil(11);
+        hello["extensions"].as_array_mut().unwrap().truncate(keep);
+        assert!((CONTROL_MAX as usize - 11..=CONTROL_MAX as usize).contains(&serde_json::to_vec(&hello).unwrap().len()));
+        let now = Instant::now();
+        let mut c = Core::new(Role::Server, Options { extensions: names, ..Options::default() }, None, None, now).unwrap();
+        c.on_frame(ctl_frame(ctl::HELLO, hello), now);
+        let frames = drain(&mut c);
+        assert!(frames.iter().all(|f| f.ty != ctl::WELCOME && f.payload.len() <= CONTROL_MAX as usize));
+        assert_eq!(close_code(&frames), Some(u64::from(code::GOING_AWAY)));
+    }
+
+    // 4: a CLOSE body is checked like any control payload (core §4.1, §9.1).
+    #[test]
+    fn a_close_without_a_usable_code_is_invalid() {
+        for body in [json!({}), json!({ "code": "1000" }), json!({ "code": 1000.5 }), json!({ "code": -1 }), json!({ "code": 1000, "reason": 7 })] {
+            let mut c = welcomed(Options::default());
+            c.on_frame(ctl_frame(ctl::CLOSE, body.clone()), Instant::now());
+            assert_eq!(c.close_info().unwrap().code, code::INVALID_MESSAGE, "{body}");
+            assert_eq!(close_code(&drain(&mut c)), Some(u64::from(code::INVALID_MESSAGE)), "{body}");
+        }
+    }
+
+    // 5: a closing channel discards its probes (core §8.1), so its pings end at once.
+    #[test]
+    fn closing_a_channel_ends_its_pings_at_once() {
+        let now = Instant::now();
+        let mut c = welcomed(Options::default());
+        let (id, sig) = open_channel(&mut c, now);
+        let mut rx = c.ping(Some((id, &sig)), now).unwrap();
+        drain(&mut c);
+        let _closed = c.close_channel(id, &sig, code::NORMAL, None, now);
+        assert!(matches!(rx.try_recv(), Ok(Err(Error::ChannelClosed(_)))));
+        assert!(c.pings.is_empty());
+    }
+
+    #[test]
+    fn a_channel_error_ends_its_pings_at_once() {
+        let now = Instant::now();
+        let mut c = welcomed(Options::default());
+        let (id, sig) = open_channel(&mut c, now);
+        let mut rx = c.ping(Some((id, &sig)), now).unwrap();
+        drain(&mut c);
+        // Fragments with different types: CLOSE_CHANNEL 1002 (core §7).
+        c.on_frame(Frame::new(id, 1, MORE, b"a".to_vec()), now);
+        c.on_frame(Frame::new(id, 2, 0, b"b".to_vec()), now);
+        assert!(c.channels[&id].sent_close);
+        assert!(matches!(rx.try_recv(), Ok(Err(Error::ChannelClosed(i))) if i.code == code::PROTOCOL_ERROR));
+        assert!(c.pings.is_empty());
     }
 }

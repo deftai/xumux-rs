@@ -376,7 +376,11 @@ async fn read_loop<R: AsyncRead + Unpin>(shared: Arc<Shared>, mut r: R, use_magi
         }
     }
     let mut core = shared.lock();
-    // Bytes after a failure are not read. The writer still sends CLOSE, then the transport ends.
+    // After a protocol failure the loop above keeps reading, so the peer's CLOSE can arrive (core
+    // §9.1). It stops only when the read ends or fails, the session is done, or a frame is too
+    // large: its payload is left unread (core §2.3 step 1), so no later frame can be found. If our
+    // CLOSE is queued but unwritten, the writer still sends it, and the close timeout (or, when it
+    // was a reply, the write itself) ends the connection. Otherwise the transport is done now.
     if !core.close_written() && !core.is_done() && core.is_ended() {
         drop(core);
         // Wait for the writer: it finishes the connection after writing CLOSE.
@@ -433,7 +437,9 @@ async fn write_loop<W: AsyncWrite + Unpin>(shared: Arc<Shared>, mut w: W, use_ma
         }
         if close_now || done {
             if done {
-                let _ = w.shutdown().await;
+                // Nothing waits on this shutdown, and on TLS it can need the peer to read: bound it.
+                let limit = shared.lock().close_timeout();
+                let _ = tokio::time::timeout(limit, w.shutdown()).await;
             } else if shared.until_done(w.shutdown()).await.is_none() {
                 return;
             }
@@ -557,7 +563,9 @@ async fn write_messages<W: MessageWriter>(shared: Arc<Shared>, mut w: W) {
             if !shared.lock().is_done() {
                 waiting.await;
             }
-            w.close().await;
+            // A transport close handshake (WebSocket) needs the peer to read, which it may never do.
+            let limit = shared.lock().close_timeout();
+            let _ = tokio::time::timeout(limit, w.close()).await;
             return;
         }
         if !had_frame {

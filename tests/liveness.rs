@@ -222,3 +222,91 @@ async fn send_reports_a_failed_message_write() {
     let r = tokio::time::timeout(Duration::from_secs(2), ch.send(1, Bytes::from_static(b"lost"))).await.unwrap();
     assert!(r.is_err(), "a message that never reached the transport was reported as sent");
 }
+
+// --- Ending the transport ---
+
+/// A writer whose shutdown never completes, as on TLS when the peer stops reading.
+struct NoShutdown<W> {
+    inner: W,
+    dropped: Arc<AtomicBool>,
+}
+
+impl<W> Drop for NoShutdown<W> {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for NoShutdown<W> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Pending
+    }
+}
+
+async fn wait_dropped(dropped: &AtomicBool) -> bool {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !dropped.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+#[tokio::test]
+async fn a_shutdown_that_never_completes_does_not_hold_the_transport() {
+    let (a, mut peer) = duplex(4096);
+    let (r, w) = split(a);
+    let dropped = Arc::new(AtomicBool::new(false));
+    let w = NoShutdown { inner: w, dropped: dropped.clone() };
+    let srv = tokio::spawn(Session::accept(r, w, opts(), acceptor()));
+    peer.write_all(b"XMUX").await.unwrap();
+    peer.write_all(&frame(0, 0x01, 0, HELLO)).await.unwrap();
+    let s = srv.await.unwrap().unwrap();
+    // The end of the peer's stream ends the session at once, so the writer finds it already done.
+    peer.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), s.closed()).await.unwrap();
+    assert!(wait_dropped(&dropped).await, "the writer is stuck in shutdown");
+}
+
+/// A message writer whose close never completes, as on a WebSocket whose peer stopped reading.
+struct NoClose {
+    dropped: Arc<AtomicBool>,
+}
+
+impl Drop for NoClose {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+impl MessageWriter for NoClose {
+    async fn write(&mut self, _: Bytes) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn close(&mut self) {
+        std::future::pending::<()>().await
+    }
+}
+
+#[tokio::test]
+async fn a_message_close_that_never_completes_does_not_hold_the_transport() {
+    let (in_tx, in_rx) = mpsc::channel(64);
+    let reader = MemReader { rx: in_rx, dropped: Arc::new(AtomicBool::new(false)) };
+    let dropped = Arc::new(AtomicBool::new(false));
+    let srv = tokio::spawn(Session::accept_messages(reader, NoClose { dropped: dropped.clone() }, opts(), acceptor()));
+    in_tx.send(Incoming::Binary(frame(0, 0x01, 0, HELLO).into())).await.unwrap();
+    let s = srv.await.unwrap().unwrap();
+    // The peer never answers, so the close timeout ends the session.
+    tokio::time::timeout(Duration::from_secs(2), s.close(code::NORMAL, "")).await.unwrap();
+    assert!(wait_dropped(&dropped).await, "the writer is stuck in close");
+}
