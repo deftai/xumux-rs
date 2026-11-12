@@ -19,6 +19,12 @@ const MAX_CREDIT: u64 = (1 << 31) - 1;
 const WINDOW_ENTRIES_PER_FRAME: usize = (CONTROL_MAX as usize) / 6;
 pub const QUIC_MULTISTREAM: &str = "quic-multistream/1";
 const DATAGRAM_QUARANTINE: Duration = Duration::from_secs(2);
+/// The shortest wait before a probe counts as lost: RFC 6298's minimum RTO.
+const MIN_PROBE_WAIT: Duration = Duration::from_secs(1);
+/// pingInterval and pingTimeout have no upper bound in the spec, so larger values are clamped to a
+/// year, which is as good as never, rather than refused. That keeps every deadline built from them
+/// far inside what `Instant` can represent.
+const MAX_PING_SECS: u64 = 365 * 24 * 3600;
 
 /// What a receiver declares: core §3.4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,8 +290,11 @@ struct Chan {
 
 struct PendingPing {
     channel: u16,
-    sig: Option<Arc<Signals>>,
     sent: Instant,
+    /// After this the probe counts as lost. None if the deadline can't be represented as an
+    /// `Instant`: such a probe is then never expired, only answered or dropped with its channel.
+    deadline: Option<Instant>,
+    /// None for the probes this side sends itself: keepalive and window growth.
     waiter: Option<oneshot::Sender<Result<Duration>>>,
 }
 
@@ -315,6 +324,8 @@ pub struct Core {
     /// Where each priority's round robin last stopped.
     cursor: HashMap<u8, u16>,
     pings: HashMap<u32, PendingPing>,
+    /// A growth probe was sent outside `tick`, so the driver should call `tick` again for its deadline.
+    timer_kick: bool,
     epoch: Instant,
     last_recv: Instant,
     keepalive_sent: Option<Instant>,
@@ -362,6 +373,12 @@ fn opt_int(o: &Map<String, Value>, key: &str) -> std::result::Result<Option<u64>
             .map(Some)
             .ok_or_else(|| Refusal::new(code::INVALID_MESSAGE, format!("{key} must be a non-negative integer"))),
     }
+}
+
+/// Close codes are 16-bit. A wider one is out of range (core §4.1), and casting it down could turn
+/// it into another code, even 1000.
+fn close_code(v: u64) -> std::result::Result<u16, Refusal> {
+    u16::try_from(v).map_err(|_| Refusal::new(code::INVALID_MESSAGE, "code is out of range"))
 }
 
 fn bool_field(o: &Map<String, Value>, key: &str) -> std::result::Result<bool, Refusal> {
@@ -435,8 +452,8 @@ impl Core {
         Ok(Core {
             role,
             phase: Phase::Handshake,
-            ping_interval: opts.ping_interval,
-            ping_timeout: opts.ping_timeout,
+            ping_interval: opts.ping_interval.min(MAX_PING_SECS),
+            ping_timeout: opts.ping_timeout.min(MAX_PING_SECS),
             opts,
             remote: Limits::default(),
             policy,
@@ -450,6 +467,7 @@ impl Core {
             sendable: BTreeSet::new(),
             cursor: HashMap::new(),
             pings: HashMap::new(),
+            timer_kick: false,
             epoch: now,
             last_recv: now,
             keepalive_sent: None,
@@ -678,7 +696,11 @@ impl Core {
     // --- Handshake ---
 
     /// Client: queue HELLO, with channels to open during the handshake.
-    pub(crate) fn start_client(&mut self, channels: &[ChannelSpec], now: Instant) -> Vec<(u16, Arc<Signals>)> {
+    pub(crate) fn start_client(&mut self, channels: &[ChannelSpec], now: Instant) -> Result<Vec<(u16, Arc<Signals>)>> {
+        // Odd IDs below the reserved 0xFFFF: 1, 3, ..., 65533.
+        if channels.len() > usize::from(RESERVED_CHANNEL / 2) {
+            return Err(Error::Invalid("too many channels for HELLO"));
+        }
         let mut out = Vec::new();
         let mut reqs = Vec::new();
         let mut id = 1u16;
@@ -709,7 +731,7 @@ impl Core {
             hello["extensions"] = json!(self.opts.extensions);
         }
         self.queue_ctrl(ctl::HELLO, &hello, now);
-        out
+        Ok(out)
     }
 
     fn version_ok(v: &[u64]) -> bool {
@@ -812,8 +834,8 @@ impl Core {
             "rejected": rejected,
         });
         self.queue_ctrl(ctl::WELCOME, &welcome, now);
-        self.ping_interval = self.opts.ping_interval;
-        self.ping_timeout = self.opts.ping_timeout;
+        self.ping_interval = self.opts.ping_interval.min(MAX_PING_SECS);
+        self.ping_timeout = self.opts.ping_timeout.min(MAX_PING_SECS);
         self.phase = Phase::Open;
         // Credit granted to the peer takes effect only now that its limits are known.
         let init = u64::from(self.remote.initial_window);
@@ -840,10 +862,10 @@ impl Core {
         self.remote = limits_from(&o)?;
         self.multistream = o.get("extensions").and_then(Value::as_array).is_some_and(|a| a.iter().any(|e| e == QUIC_MULTISTREAM));
         if let Some(v) = opt_int(&o, "pingInterval")? {
-            self.ping_interval = v;
+            self.ping_interval = v.min(MAX_PING_SECS);
         }
         if let Some(v) = opt_int(&o, "pingTimeout")? {
-            self.ping_timeout = v;
+            self.ping_timeout = v.min(MAX_PING_SECS);
         }
         let init = u64::from(self.remote.initial_window);
         let opening: BTreeSet<u16> = self.channels.keys().copied().collect();
@@ -879,18 +901,20 @@ impl Core {
                     return Err(Refusal::new(code::INVALID_MESSAGE, "bad WELCOME refusal"));
                 };
                 let id = int_field(co, "id")?;
-                let rcode = int_field(co, "code")?;
+                let rcode = close_code(int_field(co, "code")?)?;
                 let reason = opt_str(co, "reason")?.unwrap_or_default();
                 let id16 = u16::try_from(id).ok().filter(|i| opening.contains(i) && !answered.contains(i));
                 let Some(id16) = id16 else {
                     return Err(Refusal::new(code::PROTOCOL_ERROR, "WELCOME lists an ID that was not in HELLO"));
                 };
                 answered.insert(id16);
-                self.rejected.push((id16, rcode as u16, reason.clone()));
-                if let Some(mut ch) = self.channels.remove(&id16)
-                    && let Some(w) = ch.open_waiter.take() {
-                        let _ = w.send(Err(Error::Refused(CloseInfo { code: rcode as u16, reason })));
+                self.rejected.push((id16, rcode, reason.clone()));
+                if let Some(mut ch) = self.channels.remove(&id16) {
+                    self.total_window -= ch.window;
+                    if let Some(w) = ch.open_waiter.take() {
+                        let _ = w.send(Err(Error::Refused(CloseInfo { code: rcode, reason })));
                     }
+                }
             }
         }
         if answered.len() != opening.len() {
@@ -1091,7 +1115,6 @@ impl Core {
             if let Some(w) = p.waiter.take() {
                 let _ = w.send(Ok(rtt));
             }
-            let _ = p.sig;
         }
     }
 
@@ -1247,12 +1270,12 @@ impl Core {
     fn on_channel_reject(&mut self, payload: &[u8]) -> std::result::Result<(), Refusal> {
         let o = parse_object(payload)?;
         let id = self.opening_channel(int_field(&o, "id")?)?;
-        let rcode = int_field(&o, "code")?;
+        let rcode = close_code(int_field(&o, "code")?)?;
         let reason = opt_str(&o, "reason")?.unwrap_or_default();
         let mut ch = self.channels.remove(&id).expect("present");
         self.total_window -= ch.window;
         if let Some(w) = ch.open_waiter.take() {
-            let _ = w.send(Err(Error::Refused(CloseInfo { code: rcode as u16, reason })));
+            let _ = w.send(Err(Error::Refused(CloseInfo { code: rcode, reason })));
         }
         Ok(())
     }
@@ -1260,7 +1283,7 @@ impl Core {
     fn on_close_channel(&mut self, payload: &[u8], now: Instant) -> std::result::Result<(), Refusal> {
         let o = parse_object(payload)?;
         let id = int_field(&o, "id")?;
-        let c = opt_int(&o, "code")?.unwrap_or(u64::from(code::NORMAL));
+        let c = close_code(opt_int(&o, "code")?.unwrap_or(u64::from(code::NORMAL)))?;
         let reason = opt_str(&o, "reason")?.unwrap_or_default();
         if id == 0 {
             self.queue_ctrl(ctl::ERROR, &json!({ "code": code::PROTOCOL_ERROR, "reason": "channel 0 closes only with the connection" }), now);
@@ -1276,15 +1299,15 @@ impl Core {
         ch.recv_close = true;
         ch.reasm = None;
         ch.state = ChanState::Closing;
-        ch.close_info.get_or_insert(CloseInfo { code: c as u16, reason });
+        ch.close_info.get_or_insert(CloseInfo { code: c, reason });
         self.abort_sends(id);
         let ch = self.channels.get_mut(&id).expect("present");
         ch.sig.recv.notify_waiters();
         ch.sig.credit.notify_waiters();
         if !ch.sent_close {
-            self.send_close_channel(id, c as u16, None, now);
+            self.send_close_channel(id, c, None, now);
         }
-        self.maybe_finish(id);
+        self.maybe_finish(id, now);
         Ok(())
     }
 
@@ -1367,10 +1390,10 @@ impl Core {
 
     fn on_close(&mut self, payload: &[u8], now: Instant) {
         let (c, reason) = match parse_object(payload) {
-            Ok(o) => (
-                o.get("code").and_then(Value::as_u64).unwrap_or(u64::from(code::PROTOCOL_ERROR)) as u16,
-                o.get("reason").and_then(Value::as_str).unwrap_or("").to_owned(),
-            ),
+            Ok(o) => match close_code(o.get("code").and_then(Value::as_u64).unwrap_or(u64::from(code::PROTOCOL_ERROR))) {
+                Ok(c) => (c, o.get("reason").and_then(Value::as_str).unwrap_or("").to_owned()),
+                Err(r) => (r.code, "CLOSE code out of range".to_owned()),
+            },
             Err(_) => (code::INVALID_MESSAGE, "malformed CLOSE".to_owned()),
         };
         self.close_info.get_or_insert(CloseInfo { code: c, reason: reason.clone() });
@@ -1517,7 +1540,7 @@ impl Core {
         self.send_close_channel(id, c, Some(reason), now);
     }
 
-    fn maybe_finish(&mut self, id: u16) {
+    fn maybe_finish(&mut self, id: u16, now: Instant) {
         let done = matches!(self.channels.get(&id), Some(c) if c.sent_close && c.recv_close);
         if !done {
             return;
@@ -1526,9 +1549,19 @@ impl Core {
         self.total_window -= ch.window;
         if ch.datagram {
             // A delayed datagram carries nothing but the ID, so it could reach a later channel.
-            self.quarantine.insert(id, Instant::now() + DATAGRAM_QUARANTINE);
+            self.quarantine.insert(id, now + DATAGRAM_QUARANTINE);
         }
         let info = ch.close_info.clone().unwrap_or(CloseInfo { code: code::NORMAL, reason: String::new() });
+        // Its PONGs can no longer arrive, and the ID may be reused.
+        self.pings.retain(|_, p| {
+            if p.channel != id {
+                return true;
+            }
+            if let Some(w) = p.waiter.take() {
+                let _ = w.send(Err(Error::ChannelClosed(info.clone())));
+            }
+            false
+        });
         *ch.sig.finished.lock().unwrap() = Some(Finished { recv: std::mem::take(&mut ch.recv), info, stats: ch.stats });
         ch.sig.recv.notify_waiters();
         ch.sig.closed.notify_waiters();
@@ -1562,6 +1595,15 @@ impl Core {
             }
             Phase::Open => {}
         }
+        let next_ping = self.expire_pings(now);
+        let wait = self.keepalive(now);
+        match next_ping {
+            Some(d) if self.phase == Phase::Open => wait.min(d.saturating_duration_since(now)),
+            _ => wait,
+        }
+    }
+
+    fn keepalive(&mut self, now: Instant) -> Duration {
         if self.ping_interval == 0 {
             return Duration::from_secs(3600);
         }
@@ -1578,12 +1620,61 @@ impl Core {
         let quiet = now.saturating_duration_since(self.last_recv);
         if quiet >= idle {
             self.keepalive_sent = Some(now);
-            let token = self.new_token(now);
-            self.queue_probe(Frame::new(0, PING, PROBE, Bytes::copy_from_slice(&token.to_be_bytes())), now);
+            // Registered like any ping, so its PONG is an RTT sample.
+            self.send_ping(0, now, None);
             self.stats.probes_sent += 1;
             return timeout;
         }
         idle - quiet
+    }
+
+    /// How long to wait for a PONG: at least `pingTimeout`, which bounds a keepalive PONG and so any
+    /// PONG on a live connection, but no less than an RFC 6298 retransmission timeout (srtt + 4 *
+    /// rttvar) for the probe's path, so a path slower than the timeout isn't counted as losing every
+    /// probe. Never under a second, so `pingTimeout: 0` doesn't expire probes at once.
+    fn ping_wait(&self, channel: u16) -> Duration {
+        let stats = self.channels.get(&channel).map(|c| c.stats).filter(|s| s.srtt.is_some()).unwrap_or(self.stats);
+        let rto = match (stats.srtt, stats.rttvar) {
+            (Some(s), Some(v)) => s.saturating_add(v.saturating_mul(4)),
+            _ => Duration::ZERO,
+        };
+        Duration::from_secs(self.ping_timeout).max(rto).max(MIN_PROBE_WAIT)
+    }
+
+    /// Queues a PING on its channel's path and records it. A PING that would overrun the control
+    /// budget closes the connection instead (core §4.2), and then nothing is left pending for it.
+    fn send_ping(&mut self, channel: u16, now: Instant, waiter: Option<oneshot::Sender<Result<Duration>>>) {
+        let token = self.new_token(now);
+        let deadline = now.checked_add(self.ping_wait(channel));
+        self.push_probe(Frame::new(channel, PING, PROBE, Bytes::copy_from_slice(&token.to_be_bytes())), now);
+        if self.close_queued || self.phase != Phase::Open {
+            if let Some(w) = waiter {
+                let _ = w.send(Err(self.closed_error()));
+            }
+            return;
+        }
+        self.pings.insert(token, PendingPing { channel, sent: now, deadline, waiter });
+    }
+
+    /// Ends pings past their deadline, as lost. Returns the next deadline.
+    fn expire_pings(&mut self, now: Instant) -> Option<Instant> {
+        let expired: Vec<u32> = self.pings.iter().filter(|(_, p)| p.deadline.is_some_and(|d| d <= now)).map(|(t, _)| *t).collect();
+        for t in expired {
+            let mut p = self.pings.remove(&t).expect("present");
+            if p.channel == 0 {
+                self.stats.probes_lost += 1;
+            } else if let Some(ch) = self.channels.get_mut(&p.channel) {
+                ch.stats.probes_lost += 1;
+                if p.waiter.is_none() {
+                    // A lost growth probe: let the next full window probe again.
+                    ch.probing_for_growth = false;
+                }
+            }
+            if let Some(w) = p.waiter.take() {
+                let _ = w.send(Err(Error::Timeout));
+            }
+        }
+        self.pings.values().filter_map(|p| p.deadline).min()
     }
 
     fn new_token(&self, now: Instant) -> u32 {
@@ -1798,7 +1889,7 @@ impl Core {
                 Some(srtt) => {
                     let measure = srtt.max(ch.stats.rtt.unwrap_or(srtt));
                     let grow = (ch.window * 2).min(max_window);
-                    if elapsed < measure * 2 && grow > ch.window && total + (grow - ch.window) <= total_allowed {
+                    if elapsed < measure.saturating_mul(2) && grow > ch.window && total + (grow - ch.window) <= total_allowed {
                         grew = grow - ch.window;
                     }
                 }
@@ -1821,9 +1912,8 @@ impl Core {
             let ch = self.channels.get_mut(&id).expect("present");
             ch.probing_for_growth = true;
             ch.stats.probes_sent += 1;
-            let token = self.new_token(now);
-            self.pings.insert(token, PendingPing { channel: id, sig: None, sent: now, waiter: None });
-            self.push_probe(Frame::new(id, PING, PROBE, Bytes::copy_from_slice(&token.to_be_bytes())), now);
+            self.send_ping(id, now, None);
+            self.timer_kick = true;
         }
     }
 
@@ -1844,10 +1934,8 @@ impl Core {
                 id
             }
         };
-        let token = self.new_token(now);
         let (tx, rx) = oneshot::channel();
-        self.pings.insert(token, PendingPing { channel: ch_id, sig: None, sent: now, waiter: Some(tx) });
-        self.push_probe(Frame::new(ch_id, PING, PROBE, Bytes::copy_from_slice(&token.to_be_bytes())), now);
+        self.send_ping(ch_id, now, Some(tx));
         Ok(rx)
     }
 
@@ -1888,8 +1976,13 @@ impl Core {
         ch.sig.recv.notify_waiters();
         self.abort_sends(id);
         self.send_close_channel(id, c, reason, now);
-        self.maybe_finish(id);
+        self.maybe_finish(id, now);
         rx
+    }
+
+    /// Whether a deadline was set since the last call, so the timer must run `tick` again.
+    pub(crate) fn take_timer_kick(&mut self) -> bool {
+        std::mem::take(&mut self.timer_kick)
     }
 
     pub(crate) fn take_accepted(&mut self) -> Option<Accepted> {
@@ -2001,7 +2094,7 @@ mod path_tests {
         let opts = Options { max_datagram: Some(1200), extensions: vec![QUIC_MULTISTREAM.into()], ..Options::default() };
         let now = Instant::now();
         let mut c = Core::new(Role::Client, opts, Some(policy), None, now).unwrap();
-        c.start_client(&[], now);
+        c.start_client(&[], now).unwrap();
         drain(&mut c);
         let welcome = json!({ "version": PROTOCOL_VERSION, "extensions": [QUIC_MULTISTREAM] });
         c.on_frame(Frame::new(0, ctl::WELCOME, 0, serde_json::to_vec(&welcome).unwrap()), now);
@@ -2053,7 +2146,7 @@ mod flow_tests {
     fn client(opts: Options, specs: &[ChannelSpec]) -> Core {
         let now = Instant::now();
         let mut c = Core::new(Role::Client, opts, None, None, now).unwrap();
-        c.start_client(specs, now);
+        c.start_client(specs, now).unwrap();
         drain(&mut c);
         c
     }
@@ -2270,5 +2363,264 @@ mod flow_tests {
         c.on_frame(ctl_frame(ctl::CHANNEL_ACK, json!({ "id": id, "reliable": true, "ordered": true, "quic": "session" })), Instant::now());
         assert!(c.is_open());
         assert!(c.channels[&id].recv.is_empty(), "a datagram must not be delivered on a stream channel");
+    }
+}
+
+#[cfg(test)]
+mod correctness_tests {
+    use super::*;
+
+    fn drain(c: &mut Core) -> Vec<Frame> {
+        let (mut out, mut done) = (Vec::new(), Vec::new());
+        while let Some(f) = c.next_frame(&mut done) {
+            out.push(f);
+        }
+        out
+    }
+
+    fn ctl_frame(ty: u8, v: Value) -> Frame {
+        Frame::new(0, ty, 0, serde_json::to_vec(&v).unwrap())
+    }
+
+    fn client_at(opts: Options, now: Instant) -> Core {
+        let mut c = Core::new(Role::Client, opts, None, None, now).unwrap();
+        c.start_client(&[], now).unwrap();
+        drain(&mut c);
+        c.on_frame(ctl_frame(ctl::WELCOME, json!({ "version": PROTOCOL_VERSION })), now);
+        c
+    }
+
+    /// An open, reliable channel with no RTT sample yet.
+    fn open_channel(c: &mut Core, now: Instant) -> (u16, Arc<Signals>) {
+        let (id, sig, _rx) = c.open_channel(ChannelSpec::reliable("x"), now).unwrap();
+        c.on_frame(ctl_frame(ctl::CHANNEL_ACK, json!({ "id": id, "reliable": true, "ordered": true })), now);
+        drain(c);
+        (id, sig)
+    }
+
+    fn close_code(frames: &[Frame]) -> Option<u64> {
+        frames.iter().find(|f| f.channel == 0 && f.ty == ctl::CLOSE).map(|f| serde_json::from_slice::<Value>(&f.payload).unwrap()["code"].as_u64().unwrap())
+    }
+
+    #[test]
+    fn a_channel_refused_in_welcome_gives_back_its_window() {
+        let now = Instant::now();
+        let mut c = Core::new(Role::Client, Options::default(), None, None, now).unwrap();
+        c.start_client(&[ChannelSpec::reliable("a")], now).unwrap();
+        drain(&mut c);
+        c.on_frame(ctl_frame(ctl::WELCOME, json!({ "version": PROTOCOL_VERSION, "rejected": [{ "id": 1, "code": 4010 }] })), now);
+        assert!(c.is_open());
+        assert_eq!(c.total_window, 0);
+    }
+
+    #[test]
+    fn an_unanswered_ping_times_out_and_counts_as_lost() {
+        let now = Instant::now();
+        let mut c = client_at(Options::default(), now);
+        let (id, sig) = open_channel(&mut c, now);
+        let mut rx = c.ping(Some((id, &sig)), now).unwrap();
+        drain(&mut c);
+        c.tick(now + Duration::from_secs(1));
+        assert!(rx.try_recv().is_err(), "still waiting before the deadline");
+        c.tick(now + Duration::from_secs(3600));
+        assert_eq!(rx.try_recv().unwrap(), Err(Error::Timeout));
+        assert!(!c.pings.values().any(|p| p.channel == id), "the channel's ping is gone (a keepalive may be pending)");
+        assert_eq!(c.channel_stats(id, &sig).probes_lost, 1);
+    }
+
+    #[test]
+    fn a_lost_connection_ping_counts_on_the_connection() {
+        let now = Instant::now();
+        let mut c = client_at(Options { ping_interval: 0, ..Options::default() }, now);
+        let mut rx = c.ping(None, now).unwrap();
+        drain(&mut c);
+        // Keepalive is off, so only the ping's deadline bounds the wait.
+        assert!(c.tick(now) <= Duration::from_secs(c.ping_timeout), "tick waits for the ping deadline");
+        c.tick(now + Duration::from_secs(3600));
+        assert_eq!(rx.try_recv().unwrap(), Err(Error::Timeout));
+        assert_eq!(c.stats.probes_lost, 1);
+    }
+
+    #[test]
+    fn a_lost_growth_probe_does_not_stop_growth_for_good() {
+        let now = Instant::now();
+        let mut c = client_at(Options::default(), now);
+        let (id, sig) = open_channel(&mut c, now);
+        let consume_window = |c: &mut Core, at: Instant| {
+            let mut left = c.channels[&id].window;
+            while left > 0 {
+                let n = left.min(65536);
+                c.on_frame(Frame::new(id, 1, 0, vec![0u8; n as usize]), at);
+                assert!(matches!(c.receive(id, &sig, at), Some(Ok(Some(_)))));
+                left -= n;
+            }
+            drain(c)
+        };
+        let probes = |frames: &[Frame]| frames.iter().filter(|f| f.channel == id && f.ty == PING && f.flags & PROBE != 0).count();
+        assert_eq!(probes(&consume_window(&mut c, now)), 1);
+        assert!(c.channels[&id].probing_for_growth);
+        let later = now + Duration::from_secs(3600);
+        c.tick(later);
+        assert!(!c.channels[&id].probing_for_growth);
+        assert_eq!(c.channels[&id].stats.probes_lost, 1);
+        assert_eq!(probes(&consume_window(&mut c, later)), 1, "probes again");
+    }
+
+    #[test]
+    fn a_channels_pings_end_with_it() {
+        let now = Instant::now();
+        let mut c = client_at(Options::default(), now);
+        let (id, sig) = open_channel(&mut c, now);
+        let mut rx = c.ping(Some((id, &sig)), now).unwrap();
+        drain(&mut c);
+        drop(c.close_channel(id, &sig, 1000, None, now));
+        c.on_frame(ctl_frame(ctl::CLOSE_CHANNEL, json!({ "id": id, "code": 1000 })), now);
+        assert!(!c.channels.contains_key(&id));
+        assert!(c.pings.is_empty());
+        assert!(matches!(rx.try_recv(), Ok(Err(Error::ChannelClosed(_)))));
+    }
+
+    #[test]
+    fn the_keepalive_pong_is_an_rtt_sample() {
+        let now = Instant::now();
+        let mut c = client_at(Options { ping_interval: 1, ..Options::default() }, now);
+        drain(&mut c);
+        c.tick(now + Duration::from_secs(1));
+        let frames = drain(&mut c);
+        let ping = frames.iter().find(|f| f.channel == 0 && f.ty == PING).expect("keepalive PING");
+        c.on_frame(Frame::new(0, PONG, PROBE, ping.payload.clone()), now + Duration::from_millis(1500));
+        assert_eq!(c.stats.rtt, Some(Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn a_close_code_above_16_bits_is_invalid() {
+        let now = Instant::now();
+        let mut c = client_at(Options::default(), now);
+        c.on_frame(ctl_frame(ctl::CLOSE, json!({ "code": 66536 })), now);
+        assert_eq!(c.close_info().unwrap().code, code::INVALID_MESSAGE);
+        assert_eq!(close_code(&drain(&mut c)), Some(u64::from(code::INVALID_MESSAGE)));
+    }
+
+    #[test]
+    fn a_close_channel_code_above_16_bits_is_invalid() {
+        let now = Instant::now();
+        let mut c = client_at(Options::default(), now);
+        let (id, _sig) = open_channel(&mut c, now);
+        c.on_frame(ctl_frame(ctl::CLOSE_CHANNEL, json!({ "id": id, "code": 66536 })), now);
+        assert_eq!(close_code(&drain(&mut c)), Some(u64::from(code::INVALID_MESSAGE)));
+    }
+
+    #[test]
+    fn a_channel_reject_code_above_16_bits_is_invalid() {
+        let now = Instant::now();
+        let mut c = client_at(Options::default(), now);
+        let (id, _sig, _rx) = c.open_channel(ChannelSpec::reliable("x"), now).unwrap();
+        drain(&mut c);
+        c.on_frame(ctl_frame(ctl::CHANNEL_REJECT, json!({ "id": id, "code": 66536 })), now);
+        assert_eq!(close_code(&drain(&mut c)), Some(u64::from(code::INVALID_MESSAGE)));
+    }
+
+    #[test]
+    fn a_welcome_refusal_code_above_16_bits_is_invalid() {
+        let now = Instant::now();
+        let mut c = Core::new(Role::Client, Options::default(), None, None, now).unwrap();
+        c.start_client(&[ChannelSpec::reliable("a")], now).unwrap();
+        drain(&mut c);
+        c.on_frame(ctl_frame(ctl::WELCOME, json!({ "version": PROTOCOL_VERSION, "rejected": [{ "id": 1, "code": 66536 }] })), now);
+        assert_eq!(close_code(&drain(&mut c)), Some(u64::from(code::INVALID_MESSAGE)));
+    }
+
+    #[test]
+    fn datagram_quarantine_runs_on_the_callers_clock() {
+        let now = Instant::now();
+        let policy: Policy = Arc::new(|_| Ok(()));
+        let opts = Options { max_datagram: Some(1200), extensions: vec![QUIC_MULTISTREAM.into()], ..Options::default() };
+        let mut c = Core::new(Role::Client, opts, Some(policy), None, now).unwrap();
+        c.start_client(&[], now).unwrap();
+        drain(&mut c);
+        c.on_frame(ctl_frame(ctl::WELCOME, json!({ "version": PROTOCOL_VERSION, "extensions": [QUIC_MULTISTREAM] })), now);
+        let (id, _sig, _rx) = c.open_channel(ChannelSpec::datagram("v"), now).unwrap();
+        c.on_frame(ctl_frame(ctl::CHANNEL_ACK, json!({ "id": id, "reliable": false, "ordered": false, "quic": "datagram" })), now);
+        drain(&mut c);
+        // The peer closes it an hour on, by the driver's clock.
+        let t = now + Duration::from_secs(3600);
+        c.on_frame(ctl_frame(ctl::CLOSE_CHANNEL, json!({ "id": id, "code": 1000 })), t);
+        assert!(!c.channels.contains_key(&id));
+        let (next, _, _) = c.open_channel(ChannelSpec::datagram("w"), t + Duration::from_secs(1)).unwrap();
+        assert_ne!(next, id, "still quarantined");
+        drain(&mut c);
+        let (later, _, _) = c.open_channel(ChannelSpec::datagram("u"), t + DATAGRAM_QUARANTINE + Duration::from_secs(1)).unwrap();
+        assert_eq!(later, id, "free again after the quarantine");
+    }
+
+    #[test]
+    fn huge_peer_ping_settings_do_not_overflow_the_clock() {
+        let now = Instant::now();
+        let mut c = Core::new(Role::Client, Options::default(), None, None, now).unwrap();
+        c.start_client(&[], now).unwrap();
+        drain(&mut c);
+        c.on_frame(ctl_frame(ctl::WELCOME, json!({ "version": PROTOCOL_VERSION, "pingInterval": u64::MAX, "pingTimeout": u64::MAX })), now);
+        assert!(c.is_open());
+        let (id, sig) = open_channel(&mut c, now);
+        let mut rx = c.ping(Some((id, &sig)), now).unwrap();
+        // A full window with no RTT sample sends a growth probe.
+        let mut left = c.channels[&id].window;
+        while left > 0 {
+            let n = left.min(65536);
+            c.on_frame(Frame::new(id, 1, 0, vec![0u8; n as usize]), now);
+            assert!(matches!(c.receive(id, &sig, now), Some(Ok(Some(_)))));
+            left -= n;
+        }
+        assert!(c.channels[&id].probing_for_growth);
+        drain(&mut c);
+        assert!(c.tick(now) > Duration::ZERO);
+        // Past every clamped bound: the probes expire and keepalive sends its PING.
+        let far = now + Duration::from_secs(2 * 365 * 24 * 3600);
+        c.tick(far);
+        assert_eq!(rx.try_recv().unwrap(), Err(Error::Timeout));
+        assert!(!c.channels[&id].probing_for_growth);
+        assert!(c.is_open());
+        assert!(drain(&mut c).iter().any(|f| f.channel == 0 && f.ty == PING), "keepalive PING");
+        c.tick(far + Duration::from_secs(1));
+        assert!(c.is_open());
+    }
+
+    /// A client whose unread PONGs leave no room in the control budget for another probe.
+    fn client_with_full_probe_queue(ping_interval: u64, now: Instant) -> Core {
+        let mut c = client_at(Options { ping_interval, ..Options::default() }, now);
+        c.opts.max_control_queue = 64; // After HELLO, which alone is larger.
+        for i in 0..5u32 {
+            c.on_frame(Frame::new(0, PING, PROBE, i.to_be_bytes().to_vec()), now);
+        }
+        assert!(c.is_open());
+        c
+    }
+
+    #[test]
+    fn a_ping_over_the_control_budget_leaves_nothing_pending() {
+        let now = Instant::now();
+        let mut c = client_with_full_probe_queue(0, now);
+        let mut rx = c.ping(None, now).unwrap();
+        assert!(!c.is_open(), "closed with RATE_LIMITED");
+        assert!(c.pings.is_empty());
+        assert!(matches!(rx.try_recv(), Ok(Err(Error::Closed(_)))));
+
+        let mut c = client_with_full_probe_queue(1, now);
+        c.tick(now + Duration::from_secs(1));
+        assert!(!c.is_open(), "the keepalive PING closed it with RATE_LIMITED");
+        assert!(c.pings.is_empty());
+    }
+
+    #[test]
+    fn too_many_hello_channels_are_refused_not_overflowed() {
+        let now = Instant::now();
+        let mut c = Core::new(Role::Client, Options::default(), None, None, now).unwrap();
+        let specs = vec![ChannelSpec::reliable("a"); 32768];
+        assert!(matches!(c.start_client(&specs, now), Err(Error::Invalid(_))));
+        assert!(c.channels.is_empty());
+        // The most there are odd IDs for still works.
+        let mut c = Core::new(Role::Client, Options::default(), None, None, now).unwrap();
+        let opened = c.start_client(&specs[..32767], now).unwrap();
+        assert_eq!(opened.last().unwrap().0, RESERVED_CHANNEL - 2);
     }
 }

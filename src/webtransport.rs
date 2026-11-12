@@ -69,7 +69,7 @@ pub async fn connect(conn: Connection, mut opts: Options, acceptor: Acceptor) ->
     let (send, recv) = conn.open_bi().await.map_err(io)?.await.map_err(io)?;
     let now = Instant::now();
     let mut core = Core::new(Role::Client, opts, acceptor.policy, acceptor.authorize, now)?;
-    let _ = core.start_client(&[], now);
+    core.start_client(&[], now)?;
     let session = Session::spawn_quic(core, recv, send, Datagrams(conn.clone()));
     session.finish_handshake_pub().await.inspect_err(|_| conn.close(VarInt::from_u32(0), b""))?;
     let s = session.clone();
