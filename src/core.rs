@@ -901,9 +901,11 @@ impl Core {
                 self.total_window -= ch.window;
             }
         }
-        debug_assert_eq!(len, size(&welcome));
+        // The running count only picks how many to refuse; what is sent is checked in full.
+        let final_len = size(&welcome);
+        debug_assert_eq!(len, final_len);
         self.accepted.retain(|a| !refused.contains(&a.id));
-        (len <= max).then_some(welcome)
+        (final_len <= max).then_some(welcome)
     }
 
     fn on_welcome(&mut self, payload: &[u8], now: Instant) {
