@@ -52,9 +52,9 @@ pub async fn accept(conn: Connection, mut opts: Options, acceptor: Acceptor) -> 
     let core = Core::new(Role::Server, opts, acceptor.policy, acceptor.authorize, Instant::now())?;
     let session = Session::spawn_quic(core, recv, send, Datagrams(conn.clone()));
     session.finish_handshake_pub().await.inspect_err(|_| conn.close(VarInt::from_u32(0), b""))?;
-    let s = session.clone();
+    let ended = session.on_end();
     tokio::spawn(async move {
-        s.closed().await;
+        ended.await;
         conn.close(VarInt::from_u32(0), b"");
     });
     Ok(session)
@@ -72,9 +72,9 @@ pub async fn connect(conn: Connection, mut opts: Options, acceptor: Acceptor) ->
     core.start_client(&[], now)?;
     let session = Session::spawn_quic(core, recv, send, Datagrams(conn.clone()));
     session.finish_handshake_pub().await.inspect_err(|_| conn.close(VarInt::from_u32(0), b""))?;
-    let s = session.clone();
+    let ended = session.on_end();
     tokio::spawn(async move {
-        s.closed().await;
+        ended.await;
         conn.close(VarInt::from_u32(0), b"");
     });
     Ok(session)

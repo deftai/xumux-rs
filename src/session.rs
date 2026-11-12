@@ -27,6 +27,62 @@ impl Shared {
         Error::Closed(self.lock().close_info().unwrap_or(CloseInfo { code: code::GOING_AWAY, reason: String::new() }))
     }
 
+    /// The application's last handle went. Runs in drop, so it never panics: a poisoned core is
+    /// left alone.
+    fn release(&self) {
+        let Ok(mut core) = self.core.lock() else { return };
+        if core.is_ended() {
+            return;
+        }
+        core.close(code::GOING_AWAY, "", Instant::now());
+        drop(core);
+        self.wake_writer.notify_one();
+        self.wake_timer.notify_one();
+    }
+
+    /// Feeds one received frame. A frame that needs the application's policy or authorize parks
+    /// the core, and the callback runs here, outside the lock, before the next frame is read. That
+    /// keeps the order of input while the rest of the session carries on. Returns whether the
+    /// connection is done.
+    async fn deliver(&self, f: Frame) -> bool {
+        let mut ask = {
+            let mut core = self.lock();
+            core.on_frame(f, Instant::now());
+            core.take_ask()
+        };
+        while let Some(a) = ask {
+            // Replies queued before the parked frame needn't wait for the callback.
+            self.wake_writer.notify_one();
+            let (id, failed) = (a.id(), a.failed());
+            // On the blocking pool, so a slow callback holds no runtime thread either.
+            let answer = match self.until_done(tokio::task::spawn_blocking(move || a.run())).await {
+                Some(Ok(r)) => r,
+                Some(Err(_)) => Err(failed),
+                None => return true,
+            };
+            let mut core = self.lock();
+            core.decided(id, answer, Instant::now());
+            ask = core.take_ask();
+        }
+        self.lock().is_done()
+    }
+
+    /// Waits for the connection to end.
+    async fn wait_closed(&self) -> CloseInfo {
+        loop {
+            let waiting = self.closed.notified();
+            tokio::pin!(waiting);
+            waiting.as_mut().enable();
+            {
+                let core = self.lock();
+                if core.is_done() {
+                    return core.close_info().unwrap_or(CloseInfo { code: code::GOING_AWAY, reason: String::new() });
+                }
+            }
+            waiting.await;
+        }
+    }
+
     /// Runs `f`, giving up once the connection is done. `None` means it gave up. A peer that stops
     /// reading or writing must not keep a task, and with it the transport, alive after the end.
     async fn until_done<F: Future>(&self, f: F) -> Option<F::Output> {
@@ -50,10 +106,23 @@ fn complete(completed: &mut Vec<tokio::sync::oneshot::Sender<Result<()>>>, r: Re
     }
 }
 
-/// One xumux connection.
+/// One xumux connection. Cloning shares it. Once the last clone and the last [`Channel`] on it are
+/// dropped, the connection closes with 1001 (GOING_AWAY), as [`Session::close`] would, without
+/// waiting: the close exchange and its timeout finish in the background.
 #[derive(Clone)]
 pub struct Session {
+    handle: Arc<SessionHandle>,
+}
+
+/// Counts the application's handles. The session's own tasks hold [`Shared`], not this.
+struct SessionHandle {
     shared: Arc<Shared>,
+}
+
+impl Drop for SessionHandle {
+    fn drop(&mut self) {
+        self.shared.release();
+    }
 }
 
 /// Server configuration.
@@ -79,6 +148,21 @@ impl Acceptor {
 }
 
 impl Session {
+    fn new(shared: Arc<Shared>) -> Session {
+        Session { handle: Arc::new(SessionHandle { shared }) }
+    }
+
+    fn shared(&self) -> &Arc<Shared> {
+        &self.handle.shared
+    }
+
+    /// Resolves when the connection ends, without holding a handle that would keep it open.
+    #[cfg(feature = "quic")]
+    pub(crate) fn on_end(&self) -> impl Future<Output = CloseInfo> + Send + 'static {
+        let shared = self.shared().clone();
+        async move { shared.wait_closed().await }
+    }
+
     /// Runs the server side on a byte stream, with magic bytes (TCP, Unix sockets, stdio).
     pub async fn accept<R, W>(reader: R, writer: W, opts: Options, acceptor: Acceptor) -> Result<Session>
     where
@@ -113,14 +197,7 @@ impl Session {
             .collect();
         let s = Session::spawn(core, reader, writer);
         s.finish_handshake().await?;
-        let mut out = Vec::with_capacity(waits.len());
-        for ((id, sig, rx), spec) in waits.into_iter().zip(channels) {
-            out.push(match rx.await {
-                Ok(Ok(_)) => Ok(Channel { session: s.clone(), id, sig, spec }),
-                Ok(Err(e)) => Err(e),
-                Err(_) => Err(s.closed_error()),
-            });
-        }
+        let out = s.hello_channels(waits, channels).await;
         Ok((s, out))
     }
 
@@ -138,7 +215,7 @@ impl Session {
         tokio::spawn(timer_loop(shared.clone()));
         tokio::spawn(read_datagrams(shared.clone(), datagrams.clone()));
         tokio::spawn(write_datagrams(shared.clone(), datagrams));
-        Session { shared }
+        Session::new(shared)
     }
 
     #[cfg(feature = "quic")]
@@ -146,16 +223,18 @@ impl Session {
         self.finish_handshake().await
     }
 
-    #[cfg(feature = "quic")]
-    pub(crate) async fn channels_from_hello(
+    /// The answers to the channels opened in HELLO. Every handle exists before the first wait, so
+    /// dropping this future closes those that open.
+    pub(crate) async fn hello_channels(
         &self,
         waits: Vec<(u16, Arc<Signals>, tokio::sync::oneshot::Receiver<Result<Properties>>)>,
         channels: Vec<ChannelSpec>,
     ) -> Vec<Result<Channel>> {
-        let mut out = Vec::with_capacity(waits.len());
-        for ((id, sig, rx), spec) in waits.into_iter().zip(channels) {
+        let pending: Vec<_> = waits.into_iter().zip(channels).map(|((id, sig, rx), spec)| (Channel::new(self.clone(), id, sig, spec), rx)).collect();
+        let mut out = Vec::with_capacity(pending.len());
+        for (ch, rx) in pending {
             out.push(match rx.await {
-                Ok(Ok(_)) => Ok(Channel { session: self.clone(), id, sig, spec }),
+                Ok(Ok(_)) => Ok(ch),
                 Ok(Err(e)) => Err(e),
                 Err(_) => Err(self.closed_error()),
             });
@@ -188,14 +267,7 @@ impl Session {
             .collect();
         let s = Session::spawn_messages(core, reader, writer);
         s.finish_handshake().await?;
-        let mut out = Vec::with_capacity(waits.len());
-        for ((id, sig, rx), spec) in waits.into_iter().zip(channels) {
-            out.push(match rx.await {
-                Ok(Ok(_)) => Ok(Channel { session: s.clone(), id, sig, spec }),
-                Ok(Err(e)) => Err(e),
-                Err(_) => Err(s.closed_error()),
-            });
-        }
+        let out = s.hello_channels(waits, channels).await;
         Ok((s, out))
     }
 
@@ -204,7 +276,7 @@ impl Session {
         tokio::spawn(read_messages(shared.clone(), reader));
         tokio::spawn(write_messages(shared.clone(), writer));
         tokio::spawn(timer_loop(shared.clone()));
-        Session { shared }
+        Session::new(shared)
     }
 
     fn spawn<R, W>(core: Core, reader: R, writer: W) -> Session
@@ -216,7 +288,7 @@ impl Session {
         tokio::spawn(read_loop(shared.clone(), reader, true));
         tokio::spawn(write_loop(shared.clone(), writer, true));
         tokio::spawn(timer_loop(shared.clone()));
-        Session { shared }
+        Session::new(shared)
     }
 
     /// A refusal returns only after the close exchange, so a caller that exits at once can't lose
@@ -231,12 +303,12 @@ impl Session {
 
     async fn wait_handshake(&self) -> Result<()> {
         loop {
-            let notify = self.shared.lock().handshake_done.clone();
+            let notify = self.shared().lock().handshake_done.clone();
             let waiting = notify.notified();
             tokio::pin!(waiting);
             waiting.as_mut().enable();
             {
-                let core = self.shared.lock();
+                let core = self.shared().lock();
                 if core.is_open() {
                     return Ok(());
                 }
@@ -249,20 +321,20 @@ impl Session {
     }
 
     fn closed_error(&self) -> Error {
-        self.shared.closed_error()
+        self.shared().closed_error()
     }
 
     /// The next channel the peer opened, or `None` once the connection has ended.
     pub async fn accept_channel(&self) -> Option<Channel> {
         loop {
-            let notify = self.shared.lock().wake_accept.clone();
+            let notify = self.shared().lock().wake_accept.clone();
             let waiting = notify.notified();
             tokio::pin!(waiting);
             waiting.as_mut().enable();
             {
-                let mut core = self.shared.lock();
+                let mut core = self.shared().lock();
                 if let Some(a) = core.take_accepted() {
-                    return Some(Channel { session: self.clone(), id: a.id, sig: a.sig, spec: a.spec });
+                    return Some(Channel::new(self.clone(), a.id, a.sig, a.spec));
                 }
                 if core.is_ended() {
                     return None;
@@ -274,12 +346,15 @@ impl Session {
 
     pub async fn open_channel(&self, spec: ChannelSpec) -> Result<Channel> {
         let (id, sig, rx) = {
-            let mut core = self.shared.lock();
+            let mut core = self.shared().lock();
             core.open_channel(spec.clone(), Instant::now())?
         };
-        self.shared.wake_writer.notify_one();
+        self.shared().wake_writer.notify_one();
+        // Made before the wait, so dropping this future closes the channel once it opens. A refused
+        // one is already gone, and dropping its handle does nothing.
+        let ch = Channel::new(self.clone(), id, sig, spec);
         match rx.await {
-            Ok(Ok(_)) => Ok(Channel { session: self.clone(), id, sig, spec }),
+            Ok(Ok(_)) => Ok(ch),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(self.closed_error()),
         }
@@ -287,47 +362,36 @@ impl Session {
 
     /// Round-trip time on channel 0.
     pub async fn ping(&self) -> Result<Duration> {
-        let rx = self.shared.lock().ping(None, Instant::now())?;
-        self.shared.wake_writer.notify_one();
+        let rx = self.shared().lock().ping(None, Instant::now())?;
+        self.shared().wake_writer.notify_one();
         // The ping has a deadline the timer may be sleeping past.
-        self.shared.wake_timer.notify_one();
+        self.shared().wake_timer.notify_one();
         rx.await.unwrap_or_else(|_| Err(self.closed_error()))
     }
 
     pub fn stats(&self) -> ProbeStats {
-        self.shared.lock().stats
+        self.shared().lock().stats
     }
 
     pub fn remote_limits(&self) -> Limits {
-        self.shared.lock().remote_limits()
+        self.shared().lock().remote_limits()
     }
 
     pub fn close_info(&self) -> Option<CloseInfo> {
-        self.shared.lock().close_info()
+        self.shared().lock().close_info()
     }
 
     /// Sends CLOSE, and waits for the exchange to finish.
     pub async fn close(&self, c: u16, reason: &str) {
-        self.shared.lock().close(c, reason, Instant::now());
-        self.shared.wake_writer.notify_one();
-        self.shared.wake_timer.notify_one();
+        self.shared().lock().close(c, reason, Instant::now());
+        self.shared().wake_writer.notify_one();
+        self.shared().wake_timer.notify_one();
         self.closed().await;
     }
 
     /// Waits for the connection to end.
     pub async fn closed(&self) -> CloseInfo {
-        loop {
-            let waiting = self.shared.closed.notified();
-            tokio::pin!(waiting);
-            waiting.as_mut().enable();
-            {
-                let core = self.shared.lock();
-                if core.is_done() {
-                    return core.close_info().unwrap_or(CloseInfo { code: code::GOING_AWAY, reason: String::new() });
-                }
-            }
-            waiting.await;
-        }
+        self.shared().wait_closed().await
     }
 }
 
@@ -363,11 +427,7 @@ async fn read_loop<R: AsyncRead + Unpin>(shared: Arc<Shared>, mut r: R, use_magi
             }
         }
         let frame = Frame { channel, ty, flags, payload: payload.freeze() };
-        let done = {
-            let mut core = shared.lock();
-            core.on_frame(frame, Instant::now());
-            core.is_done()
-        };
+        let done = shared.deliver(frame).await;
         shared.wake_writer.notify_one();
         shared.wake_timer.notify_one();
         if done {
@@ -490,11 +550,7 @@ async fn read_messages<R: MessageReader>(shared: Arc<Shared>, mut r: R) {
                     Some((code::INVALID_MESSAGE, "message length differs from the frame's"))
                 } else {
                     let payload = b.split_off(HEADER_LEN);
-                    let done = {
-                        let mut core = shared.lock();
-                        core.on_frame(Frame { channel, ty, flags, payload }, Instant::now());
-                        core.is_done()
-                    };
+                    let done = shared.deliver(Frame { channel, ty, flags, payload }).await;
                     shared.wake_writer.notify_one();
                     shared.wake_timer.notify_one();
                     if done {
@@ -659,70 +715,95 @@ async fn timer_loop(shared: Arc<Shared>) {
     }
 }
 
-/// One channel. Cloning shares it.
+/// One channel. Cloning shares it. Once the last clone, counting the one in a [`crate::pipe::Pipe`],
+/// is dropped, the channel closes with 1000 as [`Channel::close`] would, without waiting for the
+/// answer; messages not yet sent are discarded. A channel holds its [`Session`], so the connection
+/// stays open while any channel on it does.
 #[derive(Clone)]
 pub struct Channel {
+    inner: Arc<ChannelInner>,
+}
+
+struct ChannelInner {
     session: Session,
     id: u16,
     sig: Arc<Signals>,
     spec: ChannelSpec,
 }
 
+impl Drop for ChannelInner {
+    // Never panics: a poisoned core is left alone, and an ended channel or session needs nothing.
+    fn drop(&mut self) {
+        let shared = self.session.shared();
+        let Ok(mut core) = shared.core.lock() else { return };
+        let queued = core.release_channel(self.id, &self.sig, Instant::now());
+        drop(core);
+        if queued {
+            shared.wake_writer.notify_one();
+        }
+    }
+}
+
 impl Channel {
+    fn new(session: Session, id: u16, sig: Arc<Signals>, spec: ChannelSpec) -> Channel {
+        Channel { inner: Arc::new(ChannelInner { session, id, sig, spec }) }
+    }
+
     pub fn id(&self) -> u16 {
-        self.id
+        self.inner.id
     }
 
     pub fn name(&self) -> &str {
-        &self.spec.name
+        &self.inner.spec.name
     }
 
     pub fn spec(&self) -> &ChannelSpec {
-        &self.spec
+        &self.inner.spec
     }
 
     pub fn session(&self) -> &Session {
-        &self.session
+        &self.inner.session
     }
 
     pub fn profile(&self) -> Option<&str> {
-        self.spec.metadata.as_ref()?.get("profile")?.as_str()
+        self.inner.spec.metadata.as_ref()?.get("profile")?.as_str()
     }
 
     fn core(&self) -> MutexGuard<'_, Core> {
-        self.session.shared.lock()
+        self.inner.session.shared().lock()
     }
 
     fn wake(&self) {
-        self.session.shared.wake_writer.notify_one();
-        self.session.shared.wake_datagrams.notify_one();
+        self.inner.session.shared().wake_writer.notify_one();
+        self.inner.session.shared().wake_datagrams.notify_one();
     }
 
     /// Sends one message, fragmenting as needed. Resolves once it is handed to the transport. Waits
-    /// while the peer's flow-control window is used up.
+    /// while the peer's flow-control window is used up. The message is queued before the first
+    /// wait, so dropping the future doesn't take it back: it is still sent.
     pub async fn send(&self, ty: u8, payload: impl Into<Bytes>) -> Result<()> {
-        let rx = self.core().send(self.id, &self.sig, ty, payload.into())?;
+        let rx = self.core().send(self.inner.id, &self.inner.sig, ty, payload.into())?;
         self.wake();
-        rx.await.unwrap_or_else(|_| Err(self.session.closed_error()))
+        rx.await.unwrap_or_else(|_| Err(self.inner.session.closed_error()))
     }
 
     /// Queues a message without waiting for it to be sent. For senders with their own pacing, such
     /// as video, which checks [`Channel::send_credit`] and [`Channel::queued`] first.
     pub fn queue(&self, ty: u8, payload: impl Into<Bytes>) -> Result<()> {
         // The completion receiver isn't needed: a queued message reports nothing back.
-        drop(self.core().send(self.id, &self.sig, ty, payload.into())?);
+        drop(self.core().send(self.inner.id, &self.inner.sig, ty, payload.into())?);
         self.wake();
         Ok(())
     }
 
     /// Bytes that can go out now, not counting what is already queued.
     pub fn send_credit(&self) -> Result<u64> {
-        self.core().send_credit(self.id, &self.sig)
+        self.core().send_credit(self.inner.id, &self.inner.sig)
     }
 
     /// On a datagram channel, the largest message that can be sent. It can change as the path does.
     pub fn max_datagram_payload(&self) -> Option<usize> {
-        self.core().max_datagram_payload(self.id, &self.sig)
+        self.core().max_datagram_payload(self.inner.id, &self.inner.sig)
     }
 
     /// The largest message that goes out as a single frame, for protocols that forbid fragments.
@@ -731,16 +812,16 @@ impl Channel {
     }
 
     pub fn queued(&self) -> usize {
-        self.core().queued_messages(self.id, &self.sig)
+        self.core().queued_messages(self.inner.id, &self.inner.sig)
     }
 
     /// Waits until there is credit to send. For senders of unfragmented data, such as pipe/1.
     pub async fn wait_credit(&self) -> Result<u64> {
         loop {
-            let waiting = self.sig.credit.notified();
+            let waiting = self.inner.sig.credit.notified();
             tokio::pin!(waiting);
             waiting.as_mut().enable();
-            let c = self.core().send_credit(self.id, &self.sig)?;
+            let c = self.core().send_credit(self.inner.id, &self.inner.sig)?;
             if c > 0 {
                 return Ok(c);
             }
@@ -751,14 +832,14 @@ impl Channel {
     /// Receives one whole message. `None` means the channel closed normally.
     pub async fn receive(&self) -> Result<Option<Message>> {
         loop {
-            let waiting = self.sig.recv.notified();
+            let waiting = self.inner.sig.recv.notified();
             tokio::pin!(waiting);
             waiting.as_mut().enable();
             let r = {
                 let mut core = self.core();
-                let r = core.receive(self.id, &self.sig, Instant::now());
+                let r = core.receive(self.inner.id, &self.inner.sig, Instant::now());
                 if core.take_timer_kick() {
-                    self.session.shared.wake_timer.notify_one(); // A window-growth probe went out.
+                    self.inner.session.shared().wake_timer.notify_one(); // A window-growth probe went out.
                 }
                 if r.is_none() && core.is_ended() {
                     Some(Ok(None))
@@ -779,47 +860,47 @@ impl Channel {
     /// goes ahead of one at a higher number. The default is 128. This is local and changes nothing on
     /// the wire.
     pub fn set_priority(&self, priority: u8) {
-        self.core().set_priority(self.id, &self.sig, priority);
+        self.core().set_priority(self.inner.id, &self.inner.sig, priority);
     }
 
     /// With manual credit, bytes count as consumed only through [`Channel::return_credit`] (core §6).
     pub fn set_manual_credit(&self, on: bool) {
-        self.core().set_manual_credit(self.id, &self.sig, on);
+        self.core().set_manual_credit(self.inner.id, &self.inner.sig, on);
     }
 
     pub fn return_credit(&self, n: usize) {
         {
             let mut core = self.core();
-            core.return_credit(self.id, &self.sig, n as u64, Instant::now());
+            core.return_credit(self.inner.id, &self.inner.sig, n as u64, Instant::now());
             if core.take_timer_kick() {
-                self.session.shared.wake_timer.notify_one(); // A window-growth probe went out.
+                self.inner.session.shared().wake_timer.notify_one(); // A window-growth probe went out.
             }
         }
         self.wake();
     }
 
     pub async fn ping(&self) -> Result<Duration> {
-        let rx = self.core().ping(Some((self.id, &self.sig)), Instant::now())?;
+        let rx = self.core().ping(Some((self.inner.id, &self.inner.sig)), Instant::now())?;
         self.wake();
-        self.session.shared.wake_timer.notify_one(); // For the ping's deadline.
-        rx.await.unwrap_or_else(|_| Err(self.session.closed_error()))
+        self.inner.session.shared().wake_timer.notify_one(); // For the ping's deadline.
+        rx.await.unwrap_or_else(|_| Err(self.inner.session.closed_error()))
     }
 
     pub fn stats(&self) -> ProbeStats {
-        self.core().channel_stats(self.id, &self.sig)
+        self.core().channel_stats(self.inner.id, &self.inner.sig)
     }
 
     pub fn properties(&self) -> Option<Properties> {
-        self.core().channel_props(self.id, &self.sig)
+        self.core().channel_props(self.inner.id, &self.inner.sig)
     }
 
     pub fn receive_window(&self) -> Option<u64> {
-        self.core().receive_window(self.id, &self.sig)
+        self.core().receive_window(self.inner.id, &self.inner.sig)
     }
 
     /// Closes, and waits until the peer has answered.
     pub async fn close(&self, c: u16, reason: Option<&str>) {
-        let rx = self.core().close_channel(self.id, &self.sig, c, reason, Instant::now());
+        let rx = self.core().close_channel(self.inner.id, &self.inner.sig, c, reason, Instant::now());
         self.wake();
         let _ = rx.await;
     }
@@ -827,10 +908,10 @@ impl Channel {
     /// Waits for the channel to end.
     pub async fn closed(&self) {
         loop {
-            let waiting = self.sig.closed.notified();
+            let waiting = self.inner.sig.closed.notified();
             tokio::pin!(waiting);
             waiting.as_mut().enable();
-            if self.sig.finished.lock().unwrap().is_some() {
+            if self.inner.sig.finished.lock().unwrap().is_some() {
                 return;
             }
             waiting.await;

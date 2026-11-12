@@ -10,7 +10,7 @@ use bytes::Bytes;
 use tokio::io::{duplex, split, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio::sync::mpsc;
 use xumux::frame::code;
-use xumux::{Acceptor, ChannelSpec, Incoming, MessageReader, MessageWriter, Options, Session};
+use xumux::{Acceptor, Channel, ChannelSpec, Incoming, MessageReader, MessageWriter, Options, Session};
 
 fn frame(channel: u16, ty: u8, flags: u8, payload: &[u8]) -> Vec<u8> {
     let mut f = channel.to_be_bytes().to_vec();
@@ -47,19 +47,21 @@ async fn raw_server() -> (Session, DuplexStream) {
     (srv.await.unwrap().unwrap(), peer)
 }
 
-/// Fills the duplex and the writer's batch, so the server's writer is stuck in write_all.
-async fn block_writer(s: &Session) {
+/// Fills the duplex and the writer's batch, so the server's writer is stuck in write_all. Returns
+/// the channel, because dropping it would close it and discard what is queued.
+async fn block_writer(s: &Session) -> Channel {
     let ch = s.accept_channel().await.unwrap();
     for _ in 0..8 {
         ch.queue(1, Bytes::from(vec![0u8; 32768])).unwrap();
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
+    ch
 }
 
 #[tokio::test]
 async fn a_failure_with_a_blocked_writer_still_ends_the_connection() {
     let (s, mut peer) = raw_server().await;
-    block_writer(&s).await;
+    let _ch = block_writer(&s).await;
     peer.write_all(&BAD).await.unwrap();
     let info = tokio::time::timeout(Duration::from_secs(2), s.closed()).await.expect("ends within the close timeout");
     assert_eq!(info.code, code::PROTOCOL_ERROR);
@@ -68,7 +70,7 @@ async fn a_failure_with_a_blocked_writer_still_ends_the_connection() {
 #[tokio::test]
 async fn a_peer_close_with_a_blocked_writer_still_ends_the_connection() {
     let (s, mut peer) = raw_server().await;
-    block_writer(&s).await;
+    let _ch = block_writer(&s).await;
     peer.write_all(&frame(0, 0x20, 0, br#"{"code":1000}"#)).await.unwrap();
     let info = tokio::time::timeout(Duration::from_secs(2), s.closed()).await.expect("ends within the close timeout");
     assert_eq!(info.code, code::NORMAL);
@@ -190,7 +192,7 @@ async fn raw_message_server(out_cap: usize) -> (Session, mpsc::Sender<Incoming>,
 #[tokio::test]
 async fn a_failure_with_a_blocked_message_writer_still_ends_the_connection() {
     let (s, in_tx, _out_rx, _) = raw_message_server(1).await;
-    block_writer(&s).await;
+    let _ch = block_writer(&s).await;
     in_tx.send(Incoming::Binary(BAD.to_vec().into())).await.unwrap();
     let info = tokio::time::timeout(Duration::from_secs(2), s.closed()).await.expect("ends within the close timeout");
     assert_eq!(info.code, code::PROTOCOL_ERROR);

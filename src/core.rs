@@ -3,6 +3,12 @@
 //! A driver feeds it received frames with [`Core::on_frame`], takes frames to write with
 //! [`Core::next_frame`], and calls [`Core::tick`] with the time. It never asks what transport it is
 //! on (core §1.2, rule 1).
+//!
+//! The application's policy and authorize callbacks are not called from `on_frame`. A frame that
+//! needs one parks, and the core takes no more input until the driver has run the callback from
+//! [`Core::take_ask`] and handed the answer to [`Core::decided`]. A driver that holds the core in a
+//! lock runs the callback outside it, so a slow or panicking callback can't stall or poison the
+//! rest of the connection. [`Core::run_decisions`] runs them in place, for simple drivers and tests.
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -213,6 +219,60 @@ impl Refusal {
 pub type Policy = Arc<dyn Fn(&ChannelSpec) -> std::result::Result<(), Refusal> + Send + Sync>;
 pub type Authorize = Arc<dyn Fn(&Map<String, Value>) -> std::result::Result<(), Refusal> + Send + Sync>;
 
+/// A callback the core is waiting on. Run it with [`Ask::run`], anywhere, and give the answer to
+/// [`Core::decided`].
+pub struct Ask {
+    id: u64,
+    call: Call,
+}
+
+enum Call {
+    Authorize(Authorize, Arc<Map<String, Value>>),
+    Policy(Policy, ChannelSpec),
+}
+
+impl Ask {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Runs the callback. One that panics refuses: the spec has no internal-error code, so a HELLO
+    /// is refused with 4000 and a channel with 4010.
+    pub fn run(&self) -> std::result::Result<(), Refusal> {
+        let r = match &self.call {
+            Call::Authorize(f, hello) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(hello))),
+            Call::Policy(f, spec) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(spec))),
+        };
+        r.unwrap_or_else(|_| Err(self.failed()))
+    }
+
+    /// The answer for a callback that did not finish.
+    pub fn failed(&self) -> Refusal {
+        match self.call {
+            Call::Authorize(..) => Refusal::new(code::AUTH_FAILED, "authorization failed"),
+            Call::Policy(..) => Refusal::new(code::CHANNEL_REFUSED, "channel policy failed"),
+        }
+    }
+}
+
+/// A frame parked until the application has decided.
+enum Pending {
+    Hello(Box<HelloPending>),
+    Open { id: u16, spec: ChannelSpec },
+}
+
+/// A parsed HELLO. Authorize runs first, then the policy for each channel in order.
+struct HelloPending {
+    hello: Arc<Map<String, Value>>,
+    remote: Limits,
+    extensions: Vec<String>,
+    specs: Vec<(u16, ChannelSpec)>,
+    authorized: bool,
+    /// One per channel decided so far. None: over the channel limit, so the policy wasn't asked.
+    answers: Vec<Option<std::result::Result<(), Refusal>>>,
+    accepted: usize,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     Client,
@@ -289,6 +349,8 @@ struct Chan {
     sig: Arc<Signals>,
     open_waiter: Option<oneshot::Sender<Result<Properties>>>,
     close_waiters: Vec<oneshot::Sender<()>>,
+    /// Every handle went while it was opening, so it closes as soon as the answer accepts it.
+    abandoned: bool,
 }
 
 struct PendingPing {
@@ -356,6 +418,13 @@ pub struct Core {
     pub(crate) stats: ProbeStats,
     pub(crate) wake_accept: Arc<Notify>,
     pub(crate) session_closed: Arc<Notify>,
+    pending: Option<Pending>,
+    ask: Option<Ask>,
+    /// The ask handed out and not yet answered.
+    asked: Option<u64>,
+    next_ask: u64,
+    /// Frames that arrived while a decision was pending, in order.
+    backlog: VecDeque<Frame>,
 }
 
 fn new_signals() -> Arc<Signals> {
@@ -496,6 +565,11 @@ impl Core {
             stats: ProbeStats::default(),
             wake_accept: Arc::new(Notify::new()),
             session_closed: Arc::new(Notify::new()),
+            pending: None,
+            ask: None,
+            asked: None,
+            next_ask: 0,
+            backlog: VecDeque::new(),
         })
     }
 
@@ -810,11 +884,63 @@ impl Core {
             }
             specs.push((id as u16, spec));
         }
-        if let Some(auth) = &self.authorize {
-            auth(&o)?;
+        let answers = Vec::with_capacity(specs.len());
+        let h = HelloPending { hello: Arc::new(o), remote, extensions, specs, authorized: false, answers, accepted: 0 };
+        self.pending = Some(Pending::Hello(Box::new(h)));
+        self.advance_hello(now);
+        Ok(())
+    }
+
+    /// Decides what it can without the application, and stops at the first callback.
+    fn advance_hello(&mut self, now: Instant) {
+        loop {
+            let Some(Pending::Hello(h)) = &mut self.pending else { return };
+            let call = if !h.authorized {
+                match &self.authorize {
+                    Some(f) => Some(Call::Authorize(f.clone(), h.hello.clone())),
+                    None => {
+                        h.authorized = true;
+                        continue;
+                    }
+                }
+            } else if h.answers.len() == h.specs.len() {
+                None
+            } else if h.accepted >= self.opts.max_channels {
+                h.answers.push(None);
+                continue;
+            } else {
+                match &self.policy {
+                    Some(f) => Some(Call::Policy(f.clone(), h.specs[h.answers.len()].1.clone())),
+                    None => {
+                        h.answers.push(Some(Err(Refusal::new(code::UNSUPPORTED, "this side does not accept channels"))));
+                        continue;
+                    }
+                }
+            };
+            match call {
+                Some(call) => self.ask_for(call),
+                None => {
+                    if let Some(Pending::Hello(h)) = self.pending.take() {
+                        self.welcome_hello(*h, now);
+                    }
+                }
+            }
+            return;
         }
+    }
+
+    fn ask_for(&mut self, call: Call) {
+        self.next_ask += 1;
+        self.ask = Some(Ask { id: self.next_ask, call });
+    }
+
+    /// Every HELLO channel has been decided: answer with WELCOME. The size of WELCOME is known only
+    /// now, so fit_welcome may still refuse, with 4002, a channel the policy accepted. The policy
+    /// has then run for a channel that never opens, and must not assume one it accepts will.
+    fn welcome_hello(&mut self, h: HelloPending, now: Instant) {
+        let HelloPending { hello, remote, extensions, specs, answers, .. } = h;
         self.remote = remote;
-        self.hello = Some(o);
+        self.hello = Some(Arc::unwrap_or_clone(hello));
         // Each once: a HELLO that repeats one could otherwise make WELCOME too large to send.
         let ours: BTreeSet<&String> = self.opts.extensions.iter().collect();
         let mut seen = BTreeSet::new();
@@ -823,20 +949,15 @@ impl Core {
 
         let mut accepted = Vec::new();
         let mut rejected = Vec::new();
-        let mut count = 0usize;
-        for (id, spec) in specs {
-            if count >= self.opts.max_channels {
-                rejected.push(json!({ "id": id, "code": code::CHANNEL_LIMIT }));
-                continue;
-            }
-            match self.decide(&spec) {
-                Ok(()) => {
-                    count += 1;
+        for ((id, spec), answer) in specs.into_iter().zip(answers) {
+            match answer {
+                None => rejected.push(json!({ "id": id, "code": code::CHANNEL_LIMIT })),
+                Some(Ok(())) => {
                     let sig = self.insert_channel(id, ChanState::Open, now);
                     accepted.push(self.accept_path(id, &spec));
                     self.accepted.push_back(Accepted { id, spec, sig });
                 }
-                Err(r) => rejected.push(json!({ "id": id, "code": r.code, "reason": r.reason })),
+                Some(Err(r)) => rejected.push(json!({ "id": id, "code": r.code, "reason": r.reason })),
             }
         }
         let l = self.opts.limits;
@@ -854,7 +975,8 @@ impl Core {
         let Some(welcome) = self.fit_welcome(welcome) else {
             // What is left is the accepted extensions, which no channel refusal can shrink.
             self.accepted.clear();
-            return Err(Refusal::new(code::GOING_AWAY, "WELCOME does not fit in a control payload"));
+            self.fail(code::GOING_AWAY, "WELCOME does not fit in a control payload", now);
+            return;
         };
         self.queue_ctrl(ctl::WELCOME, &welcome, now);
         self.ping_interval = self.opts.ping_interval.min(MAX_PING_SECS);
@@ -867,7 +989,6 @@ impl Core {
         }
         self.handshake_done.notify_waiters();
         self.wake_accept.notify_waiters();
-        Ok(())
     }
 
     /// WELCOME, like any channel-0 payload, MUST NOT exceed 65536 bytes (core §3.1), but an answer
@@ -1017,10 +1138,54 @@ impl Core {
         body
     }
 
-    fn decide(&self, spec: &ChannelSpec) -> std::result::Result<(), Refusal> {
-        match &self.policy {
-            Some(p) => p(spec),
-            None => Err(Refusal::new(code::UNSUPPORTED, "this side does not accept channels")),
+    /// The callback the core is waiting on, if it is waiting. It takes no input until it has the
+    /// answer: frames given to it meanwhile are kept, in order, for after.
+    pub fn take_ask(&mut self) -> Option<Ask> {
+        let a = self.ask.take()?;
+        self.asked = Some(a.id);
+        Some(a)
+    }
+
+    /// Whether a decision is pending, handed out or not.
+    pub fn is_deciding(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// The answer to the ask with this ID. An answer that comes too late, because the connection
+    /// closed meanwhile, is ignored.
+    pub fn decided(&mut self, ask: u64, answer: std::result::Result<(), Refusal>, now: Instant) {
+        if self.asked != Some(ask) {
+            return;
+        }
+        self.asked = None;
+        match self.pending.take() {
+            Some(Pending::Open { id, spec }) => self.open_decided(id, spec, answer, now),
+            Some(Pending::Hello(mut h)) => {
+                if !h.authorized {
+                    if let Err(r) = answer {
+                        self.fail(r.code, &r.reason, now);
+                        return;
+                    }
+                    h.authorized = true;
+                } else {
+                    h.accepted += usize::from(answer.is_ok());
+                    h.answers.push(Some(answer));
+                }
+                self.pending = Some(Pending::Hello(h));
+                self.advance_hello(now);
+            }
+            None => {}
+        }
+        while self.pending.is_none() && let Some(f) = self.backlog.pop_front() {
+            self.on_frame_via(f, now, false);
+        }
+    }
+
+    /// Runs every callback in place until nothing is pending.
+    pub fn run_decisions(&mut self, now: Instant) {
+        while let Some(a) = self.take_ask() {
+            let answer = a.run();
+            self.decided(a.id, answer, now);
         }
     }
 
@@ -1056,6 +1221,7 @@ impl Core {
                 sig: sig.clone(),
                 open_waiter: None,
                 close_waiters: Vec::new(),
+                abandoned: false,
             },
         );
         sig
@@ -1084,6 +1250,12 @@ impl Core {
         self.last_recv = now;
         self.keepalive_sent = None;
         if self.phase == Phase::Done {
+            return;
+        }
+        // Order matters on the base path, so nothing overtakes a frame waiting on the application.
+        // Datagrams have no order to keep.
+        if self.pending.is_some() && !via_datagram {
+            self.backlog.push_back(f);
             return;
         }
         // Step 3.
@@ -1273,7 +1445,19 @@ impl Core {
             self.queue_ctrl(ctl::CHANNEL_REJECT, &json!({ "id": id, "code": code::CHANNEL_LIMIT, "reason": "too many channels" }), now);
             return Ok(());
         }
-        match self.decide(&spec) {
+        match &self.policy {
+            Some(f) => {
+                let call = Call::Policy(f.clone(), spec.clone());
+                self.pending = Some(Pending::Open { id, spec });
+                self.ask_for(call);
+            }
+            None => self.open_decided(id, spec, Err(Refusal::new(code::UNSUPPORTED, "this side does not accept channels")), now),
+        }
+        Ok(())
+    }
+
+    fn open_decided(&mut self, id: u16, spec: ChannelSpec, answer: std::result::Result<(), Refusal>, now: Instant) {
+        match answer {
             Ok(()) => {
                 let sig = self.insert_channel(id, ChanState::Open, now);
                 let ack = self.accept_path(id, &spec);
@@ -1285,7 +1469,6 @@ impl Core {
                 self.queue_ctrl(ctl::CHANNEL_REJECT, &json!({ "id": id, "code": r.code, "reason": r.reason }), now);
             }
         }
-        Ok(())
     }
 
     fn opening_channel(&self, id: u64) -> std::result::Result<u16, Refusal> {
@@ -1306,6 +1489,13 @@ impl Core {
         ch.send_credit = init;
         if let Some(w) = ch.open_waiter.take() {
             let _ = w.send(Ok(props));
+        }
+        if ch.abandoned {
+            // Nobody wants it, and core §5.2 says to close it once it is open.
+            ch.held.clear();
+            let sig = ch.sig.clone();
+            drop(self.close_channel(id, &sig, code::NORMAL, None, now));
+            return Ok(());
         }
         // Frames that overtook this answer can be processed now. Only datagrams are ever held, so they
         // replay as datagrams: if the answer put the channel on a stream, they are discarded (core §1.2).
@@ -1532,6 +1722,11 @@ impl Core {
     }
 
     fn end_channels(&mut self) {
+        // Nothing opens once the connection is closing, and nothing already ended is handed out.
+        self.pending = None;
+        self.ask = None;
+        self.asked = None;
+        self.accepted.clear();
         let info = self.close_info.clone().unwrap_or(CloseInfo { code: code::GOING_AWAY, reason: String::new() });
         let ids: Vec<u16> = self.channels.keys().copied().collect();
         for id in ids {
@@ -2060,6 +2255,28 @@ impl Core {
         rx
     }
 
+    /// The application dropped its last handle: close as `close_channel(1000)` would, or, if it is
+    /// still opening, as soon as it opens. Returns whether a frame was queued.
+    pub(crate) fn release_channel(&mut self, id: u16, sig: &Arc<Signals>, now: Instant) -> bool {
+        if self.phase != Phase::Open && self.phase != Phase::Handshake {
+            return false;
+        }
+        if sig.finished.lock().map_or(true, |f| f.is_some()) {
+            return false;
+        }
+        let Some(ch) = self.live(id, sig) else { return false };
+        if ch.state == ChanState::Opening {
+            ch.abandoned = true;
+            ch.open_waiter = None;
+            return false;
+        }
+        if ch.sent_close {
+            return false;
+        }
+        drop(self.close_channel(id, sig, code::NORMAL, None, now));
+        true
+    }
+
     /// Whether a deadline was set since the last call, so the timer must run `tick` again.
     pub(crate) fn take_timer_kick(&mut self) -> bool {
         std::mem::take(&mut self.timer_kick)
@@ -2101,6 +2318,7 @@ mod path_tests {
     fn open(c: &mut Core, id: u16, quic: &str) -> Value {
         let body = json!({ "id": id, "name": "x", "reliable": false, "ordered": false, "quic": quic });
         c.on_frame(Frame::new(0, ctl::OPEN_CHANNEL, 0, serde_json::to_vec(&body).unwrap()), Instant::now());
+        c.run_decisions(Instant::now());
         serde_json::from_slice(&drain(c)[0].payload).unwrap()
     }
 
@@ -2134,6 +2352,7 @@ mod path_tests {
         assert_eq!(open(&mut c, 1, "datagram")["quic"], "datagram");
         let body = json!({ "id": 3, "name": "y", "reliable": true, "ordered": true });
         c.on_frame(Frame::new(0, ctl::OPEN_CHANNEL, 0, serde_json::to_vec(&body).unwrap()), Instant::now());
+        c.run_decisions(Instant::now());
         drain(&mut c);
 
         c.on_frame(Frame::new(1, 7, 0, b"wrong path".to_vec()), Instant::now()); // Datagram channel, on the stream.
@@ -2932,5 +3151,144 @@ mod hygiene_tests {
         assert!(c.channels[&id].sent_close);
         assert!(matches!(rx.try_recv(), Ok(Err(Error::ChannelClosed(i))) if i.code == code::PROTOCOL_ERROR));
         assert!(c.pings.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod decision_tests {
+    use super::*;
+
+    fn drain(c: &mut Core) -> Vec<Frame> {
+        let (mut out, mut done) = (Vec::new(), Vec::new());
+        while let Some(f) = c.next_frame(&mut done) {
+            out.push(f);
+        }
+        out
+    }
+
+    fn ctl_frame(ty: u8, v: Value) -> Frame {
+        Frame::new(0, ty, 0, serde_json::to_vec(&v).unwrap())
+    }
+
+    fn open_frame(id: u16, name: &str) -> Frame {
+        ctl_frame(ctl::OPEN_CHANNEL, json!({ "id": id, "name": name, "reliable": true, "ordered": true }))
+    }
+
+    fn body(f: &Frame) -> Value {
+        serde_json::from_slice(&f.payload).unwrap()
+    }
+
+    fn server(authorize: Option<Authorize>) -> Core {
+        let policy: Policy = Arc::new(|s: &ChannelSpec| if s.name == "no" { Err(Refusal::new(code::CHANNEL_REFUSED, "no")) } else { Ok(()) });
+        Core::new(Role::Server, Options::default(), Some(policy), authorize, Instant::now()).unwrap()
+    }
+
+    fn connected() -> Core {
+        let mut c = server(None);
+        c.on_frame(ctl_frame(ctl::HELLO, json!({ "version": PROTOCOL_VERSION })), Instant::now());
+        assert!(c.is_open() && c.take_ask().is_none());
+        drain(&mut c);
+        c
+    }
+
+    #[test]
+    fn frames_after_a_parked_open_wait_for_its_answer() {
+        let now = Instant::now();
+        let mut c = connected();
+        c.on_frame(open_frame(1, "a"), now);
+        c.on_frame(open_frame(3, "no"), now);
+        c.on_frame(Frame::new(0, PING, PROBE, vec![0, 0, 0, 9]), now);
+        assert!(drain(&mut c).is_empty(), "nothing is answered before the policy");
+        let a = c.take_ask().expect("the policy for channel 1");
+        assert!(c.take_ask().is_none(), "one decision at a time");
+        c.decided(a.id(), a.run(), now);
+        let out = drain(&mut c);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].ty, body(&out[0])["id"].as_u64()), (ctl::CHANNEL_ACK, Some(1)));
+        // The OPEN for 3 was replayed, and parked in turn. The PING behind it still waits.
+        let a = c.take_ask().expect("the policy for channel 3");
+        c.decided(a.id(), a.run(), now);
+        let out = drain(&mut c);
+        assert_eq!((out[0].ty, body(&out[0])["id"].as_u64()), (ctl::CHANNEL_REJECT, Some(3)));
+        assert_eq!((out[1].ty, out[1].flags), (PONG, PROBE));
+        assert!(!c.is_deciding());
+    }
+
+    #[test]
+    fn welcome_waits_until_authorize_and_every_channel_are_decided() {
+        let now = Instant::now();
+        let auth: Authorize = Arc::new(|_| Ok(()));
+        let mut c = server(Some(auth));
+        let chans = json!([{ "id": 1, "name": "a", "reliable": true, "ordered": true }, { "id": 3, "name": "no", "reliable": true, "ordered": true }]);
+        c.on_frame(ctl_frame(ctl::HELLO, json!({ "version": PROTOCOL_VERSION, "channels": chans })), now);
+        let mut asks = 0;
+        while let Some(a) = c.take_ask() {
+            assert!(drain(&mut c).is_empty() && !c.is_open(), "WELCOME before every decision");
+            c.decided(a.id(), a.run(), now);
+            asks += 1;
+        }
+        assert_eq!(asks, 3, "authorize, then each channel");
+        assert!(c.is_open());
+        let w = body(&drain(&mut c)[0]);
+        assert_eq!(w["channels"][0]["id"], 1);
+        assert_eq!(w["rejected"][0]["id"], 3);
+    }
+
+    #[test]
+    fn a_panicking_callback_refuses() {
+        let now = Instant::now();
+        let auth: Authorize = Arc::new(|_| panic!("authorize bug"));
+        let mut c = server(Some(auth));
+        c.on_frame(ctl_frame(ctl::HELLO, json!({ "version": PROTOCOL_VERSION })), now);
+        c.run_decisions(now);
+        assert_eq!(body(&drain(&mut c)[0])["code"], code::AUTH_FAILED);
+
+        let policy: Policy = Arc::new(|_| panic!("policy bug"));
+        let mut c = Core::new(Role::Server, Options::default(), Some(policy), None, now).unwrap();
+        c.on_frame(ctl_frame(ctl::HELLO, json!({ "version": PROTOCOL_VERSION })), now);
+        drain(&mut c);
+        c.on_frame(open_frame(1, "a"), now);
+        c.run_decisions(now);
+        let out = drain(&mut c);
+        assert_eq!((out[0].ty, body(&out[0])["code"].as_u64()), (ctl::CHANNEL_REJECT, Some(u64::from(code::CHANNEL_REFUSED))));
+        assert!(c.is_open());
+    }
+
+    #[test]
+    fn an_answer_after_the_connection_closed_is_ignored() {
+        let now = Instant::now();
+        let mut c = connected();
+        c.on_frame(open_frame(1, "a"), now);
+        let a = c.take_ask().unwrap();
+        c.close(code::NORMAL, "", now);
+        c.decided(a.id(), Ok(()), now);
+        let out = drain(&mut c);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].ty, ctl::CLOSE);
+        assert!(c.channels.is_empty() && c.accepted.is_empty());
+    }
+
+    /// The opener may not close a channel that is opening (core §5.2), so a handle dropped then
+    /// closes it when the ACK lands. A REJECT leaves nothing to do.
+    #[test]
+    fn a_channel_released_while_opening_closes_once_it_opens() {
+        let now = Instant::now();
+        let mut c = Core::new(Role::Client, Options::default(), None, None, now).unwrap();
+        c.start_client(&[], now).unwrap();
+        drain(&mut c);
+        c.on_frame(ctl_frame(ctl::WELCOME, json!({ "version": PROTOCOL_VERSION })), now);
+        let (id, sig, _rx) = c.open_channel(ChannelSpec::reliable("a"), now).unwrap();
+        let (id2, sig2, _rx2) = c.open_channel(ChannelSpec::reliable("b"), now).unwrap();
+        drain(&mut c);
+        assert!(!c.release_channel(id, &sig, now));
+        assert!(!c.release_channel(id2, &sig2, now));
+        assert!(drain(&mut c).is_empty(), "no CLOSE_CHANNEL while opening");
+        c.on_frame(ctl_frame(ctl::CHANNEL_ACK, json!({ "id": id, "reliable": true, "ordered": true })), now);
+        c.on_frame(ctl_frame(ctl::CHANNEL_REJECT, json!({ "id": id2, "code": 4010 })), now);
+        let out = drain(&mut c);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].ty, body(&out[0])["id"].as_u64(), body(&out[0])["code"].as_u64()), (ctl::CLOSE_CHANNEL, Some(u64::from(id)), Some(1000)));
+        c.on_frame(ctl_frame(ctl::CLOSE_CHANNEL, json!({ "id": id })), now);
+        assert!(c.channels.is_empty());
     }
 }
