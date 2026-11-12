@@ -257,6 +257,8 @@ struct Chan {
     props: Properties,
     /// On QUIC datagrams, not the base path.
     datagram: bool,
+    /// We opened it asking for QUIC datagrams: the one case where the answer may make it unreliable.
+    asked_datagram: bool,
     /// What overtook the answer to our OPEN_CHANNEL (core §5.2).
     held: Vec<Frame>,
     priority: u8,
@@ -305,6 +307,8 @@ pub struct Core {
     ctrl_out: VecDeque<Frame>,
     ctrl_bytes: usize,
     probes_out: VecDeque<Frame>,
+    /// Bytes in probes_out, which share the control budget with ctrl_out.
+    probe_bytes: usize,
     grants: BTreeMap<u16, u64>,
     /// Channels with something to send, by priority then ID.
     sendable: BTreeSet<(u8, u16)>,
@@ -441,6 +445,7 @@ impl Core {
             ctrl_out: VecDeque::new(),
             ctrl_bytes: 0,
             probes_out: VecDeque::new(),
+            probe_bytes: 0,
             grants: BTreeMap::new(),
             sendable: BTreeSet::new(),
             cursor: HashMap::new(),
@@ -530,12 +535,27 @@ impl Core {
     /// Replies pile up if the peer doesn't read them (core §4.2).
     fn queue_ctrl_frame(&mut self, f: Frame) {
         let size = f.encoded_len();
-        if self.opts.max_control_queue > 0 && self.ctrl_bytes + size > self.opts.max_control_queue {
+        if self.over_control_budget(size) {
             self.fail(code::RATE_LIMITED, "too many unread control replies");
             return;
         }
         self.ctrl_bytes += size;
         self.ctrl_out.push_back(f);
+    }
+
+    fn over_control_budget(&self, size: usize) -> bool {
+        self.opts.max_control_queue > 0 && self.ctrl_bytes + self.probe_bytes + size > self.opts.max_control_queue
+    }
+
+    /// A PONG is a reply too, so a peer that sends PINGs and never reads is closed, not queued for.
+    fn queue_probe(&mut self, f: Frame) {
+        let size = f.encoded_len();
+        if self.over_control_budget(size) {
+            self.fail(code::RATE_LIMITED, "too many unread probe replies");
+            return;
+        }
+        self.probe_bytes += size;
+        self.probes_out.push_back(f);
     }
 
     /// Next frame to write. Control first, then probes, then channels: strict priority between
@@ -559,6 +579,7 @@ impl Core {
             return None;
         }
         if let Some(f) = self.probes_out.pop_front() {
+            self.probe_bytes -= f.encoded_len();
             return Some(f);
         }
         self.next_data_frame(completed)
@@ -569,15 +590,22 @@ impl Core {
             return None;
         }
         let mut payload = BytesMut::new();
-        let ids: Vec<u16> = self.grants.keys().copied().take(WINDOW_ENTRIES_PER_FRAME).collect();
-        for id in ids {
-            let mut left = self.grants.remove(&id).unwrap_or(0);
-            // An increment is at most 2^31-1, which may need more than one entry.
-            while left > 0 {
-                let inc = left.min(MAX_CREDIT);
+        let mut entries = 0;
+        while entries < WINDOW_ENTRIES_PER_FRAME {
+            let Some(mut e) = self.grants.first_entry() else { break };
+            // An increment is at most 2^31-1, so one grant may need several entries. A frame holds at
+            // most CONTROL_MAX/6 of them; what doesn't fit stays for the next frame.
+            let id = *e.key();
+            let left = e.get_mut();
+            while *left > 0 && entries < WINDOW_ENTRIES_PER_FRAME {
+                let inc = (*left).min(MAX_CREDIT);
                 payload.extend_from_slice(&id.to_be_bytes());
                 payload.extend_from_slice(&(inc as u32).to_be_bytes());
-                left -= inc;
+                *left -= inc;
+                entries += 1;
+            }
+            if *left == 0 {
+                e.remove();
             }
         }
         if payload.is_empty() {
@@ -620,23 +648,20 @@ impl Core {
         let can_fragment = ch.props.reliable && ch.props.ordered;
         let credit = ch.send_credit;
         let m = ch.outq.front_mut()?;
-        // A reliable channel may be out of credit, in which case it waits for WINDOW_UPDATE.
-        if reliable && credit == 0 && !m.payload.is_empty() {
+        // A reliable channel may be out of credit, in which case it waits for WINDOW_UPDATE. One that
+        // can't fragment waits until the whole message fits (core §7); send() made sure it can.
+        if reliable && !m.payload.is_empty() && (credit == 0 || (!can_fragment && credit < m.payload.len() as u64)) {
             return None;
         }
-        let mut n = m.payload.len().min(frag);
-        if reliable {
-            n = n.min(credit as usize);
-        }
-        if !can_fragment {
-            n = m.payload.len();
-        }
+        let n = if can_fragment { m.payload.len().min(frag).min(usize::try_from(credit).unwrap_or(usize::MAX)) } else { m.payload.len() };
         let chunk = m.payload.split_to(n);
         m.sent_any = true;
         let more = !m.payload.is_empty();
         let f = Frame::new(id, m.ty, if more { MORE } else { 0 }, chunk);
         if reliable {
-            ch.send_credit -= n as u64;
+            // n <= credit by the checks above; saturate rather than wrap if that ever stops being true.
+            debug_assert!(n as u64 <= ch.send_credit);
+            ch.send_credit = ch.send_credit.saturating_sub(n as u64);
         }
         if !more {
             if let Some(done) = ch.outq.pop_front().and_then(|m| m.done) {
@@ -659,6 +684,7 @@ impl Core {
         let mut id = 1u16;
         for spec in channels {
             let sig = self.insert_channel(id, ChanState::Opening, now);
+            self.channels.get_mut(&id).expect("present").asked_datagram = spec.quic.as_deref() == Some("datagram");
             reqs.push(spec.to_json(id));
             out.push((id, sig));
             id += 2;
@@ -835,9 +861,10 @@ impl Core {
                     return Err(Refusal::new(code::PROTOCOL_ERROR, "WELCOME lists an ID that was not in HELLO"));
                 };
                 answered.insert(id16);
-                let datagram = opt_str(co, "quic")?.as_deref() == Some("datagram");
+                let props = Properties { reliable, ordered };
+                let datagram = self.check_granted(id16, props, opt_str(co, "quic")?.as_deref())?;
                 let ch = self.channels.get_mut(&id16).expect("present");
-                ch.props = Properties { reliable, ordered };
+                ch.props = props;
                 ch.datagram = datagram;
                 ch.state = ChanState::Open;
                 ch.send_credit = init;
@@ -915,6 +942,7 @@ impl Core {
                 // Only a base path exists: every channel is effectively reliable and ordered.
                 props: Properties { reliable: true, ordered: true },
                 datagram: false,
+                asked_datagram: false,
                 held: Vec::new(),
                 priority: 128,
                 send_credit: if self.phase == Phase::Open { u64::from(self.remote.initial_window) } else { 0 },
@@ -1072,7 +1100,7 @@ impl Core {
         if self.channels.get(&f.channel).is_some_and(|c| c.datagram) {
             self.push_datagram(f);
         } else {
-            self.probes_out.push_back(f);
+            self.queue_probe(f);
         }
     }
 
@@ -1176,7 +1204,7 @@ impl Core {
         let id = self.opening_channel(int_field(&o, "id")?)?;
         let props = Properties { reliable: bool_field(&o, "reliable")?, ordered: bool_field(&o, "ordered")? };
         let init = u64::from(self.remote.initial_window);
-        let datagram = opt_str(&o, "quic")?.as_deref() == Some("datagram");
+        let datagram = self.check_granted(id, props, opt_str(&o, "quic")?.as_deref())?;
         let ch = self.channels.get_mut(&id).expect("present");
         ch.props = props;
         ch.datagram = datagram;
@@ -1185,11 +1213,35 @@ impl Core {
         if let Some(w) = ch.open_waiter.take() {
             let _ = w.send(Ok(props));
         }
-        // Frames that overtook this answer can be processed now.
+        // Frames that overtook this answer can be processed now. Only datagrams are ever held, so they
+        // replay as datagrams: if the answer put the channel on a stream, they are discarded (core §1.2).
         for f in std::mem::take(&mut ch.held) {
-            self.on_frame_via(f, now, datagram);
+            self.on_frame_via(f, now, true);
         }
         Ok(())
+    }
+
+    /// Checks the effective properties in a CHANNEL_ACK or WELCOME entry for a channel we opened, and
+    /// returns whether it is on QUIC datagrams. They must be those of the path the answer names (core
+    /// §5.3). Every path here other than datagrams is a reliable, ordered stream (core §1.2, quic
+    /// binding §3, quic-multistream §2 table), so any other answer would switch off flow control or
+    /// fragmentation rules without a path to justify it. The responder may move a channel to the
+    /// session stream (quic-multistream §2), which makes an unreliable request reliable, but may place
+    /// one on datagrams only if that was requested and the extension is in use.
+    fn check_granted(&self, id: u16, props: Properties, quic: Option<&str>) -> std::result::Result<bool, Refusal> {
+        let datagram = quic == Some("datagram");
+        let expect = if datagram {
+            if !self.multistream || !self.channels.get(&id).is_some_and(|c| c.asked_datagram) {
+                return Err(Refusal::new(code::PROTOCOL_ERROR, "channel placed on datagrams without being asked"));
+            }
+            Properties { reliable: false, ordered: false }
+        } else {
+            Properties { reliable: true, ordered: true }
+        };
+        if props != expect {
+            return Err(Refusal::new(code::PROTOCOL_ERROR, "effective properties do not match the channel's path"));
+        }
+        Ok(datagram)
     }
 
     fn on_channel_reject(&mut self, payload: &[u8]) -> std::result::Result<(), Refusal> {
@@ -1331,6 +1383,9 @@ impl Core {
                 self.ctrl_out.clear();
                 self.ctrl_bytes = 0;
                 self.grants.clear();
+                // Never written after CLOSE, and they would count against the budget the reply needs.
+                self.probes_out.clear();
+                self.probe_bytes = 0;
                 self.queue_ctrl(ctl::CLOSE, &json!({ "code": c }));
                 self.close_queued = true;
                 self.peer_closed = true;
@@ -1351,6 +1406,7 @@ impl Core {
         self.ctrl_bytes = 0;
         self.grants.clear();
         self.probes_out.clear();
+        self.probe_bytes = 0;
         let body = if reason.is_empty() { json!({ "code": c }) } else { json!({ "code": c, "reason": reason }) };
         self.queue_ctrl(ctl::CLOSE, &body);
         self.close_queued = true;
@@ -1519,7 +1575,7 @@ impl Core {
         if quiet >= idle {
             self.keepalive_sent = Some(now);
             let token = self.new_token(now);
-            self.probes_out.push_back(Frame::new(0, PING, PROBE, Bytes::copy_from_slice(&token.to_be_bytes())));
+            self.queue_probe(Frame::new(0, PING, PROBE, Bytes::copy_from_slice(&token.to_be_bytes())));
             self.stats.probes_sent += 1;
             return timeout;
         }
@@ -1552,10 +1608,11 @@ impl Core {
             .find(|i| !self.channels.contains_key(i) && !self.quarantine.contains_key(i))
             .ok_or(Error::Invalid("no free channel IDs"))?;
         let body = spec.to_json(id);
-        let _ = spec;
         let sig = self.insert_channel(id, ChanState::Opening, now);
         let (tx, rx) = oneshot::channel();
-        self.channels.get_mut(&id).expect("present").open_waiter = Some(tx);
+        let ch = self.channels.get_mut(&id).expect("present");
+        ch.open_waiter = Some(tx);
+        ch.asked_datagram = spec.quic.as_deref() == Some("datagram");
         self.queue_ctrl(ctl::OPEN_CHANNEL, &body);
         Ok((id, sig, rx))
     }
@@ -1597,6 +1654,13 @@ impl Core {
         let ch = self.channels.get_mut(&id).expect("checked");
         if !(ch.props.reliable && ch.props.ordered) && payload.len() > frame_limit {
             return Err(Error::TooLarge { size: payload.len(), limit: frame_limit });
+        }
+        // A reliable message that can't fragment needs that much credit at once, and a channel never
+        // has more than the peer's initial window outstanding. Limits::valid() implies this, but
+        // frame_from would wait forever if it didn't hold.
+        let window = self.remote.initial_window as usize;
+        if ch.props.reliable && !ch.props.ordered && payload.len() > window {
+            return Err(Error::TooLarge { size: payload.len(), limit: window });
         }
         let (tx, rx) = oneshot::channel();
         if ch.datagram {
@@ -1959,5 +2023,248 @@ mod path_tests {
         }
         assert!(c.dgram_bytes <= c.opts.max_control_queue);
         assert_eq!(c.next_datagram().unwrap().payload[0], (((3000 - c.dgram_out.len() - 1) as u32) % 251) as u8, "the oldest kept");
+    }
+}
+
+#[cfg(test)]
+mod flow_tests {
+    use super::*;
+
+    fn drain(c: &mut Core) -> Vec<Frame> {
+        let (mut out, mut done) = (Vec::new(), Vec::new());
+        while let Some(f) = c.next_frame(&mut done) {
+            out.push(f);
+        }
+        out
+    }
+
+    fn ctl_frame(ty: u8, v: Value) -> Frame {
+        Frame::new(0, ty, 0, serde_json::to_vec(&v).unwrap())
+    }
+
+    fn close_code(frames: &[Frame]) -> Option<u64> {
+        frames.iter().find(|f| f.channel == 0 && f.ty == ctl::CLOSE).map(|f| serde_json::from_slice::<Value>(&f.payload).unwrap()["code"].as_u64().unwrap())
+    }
+
+    fn client(opts: Options, specs: &[ChannelSpec]) -> Core {
+        let now = Instant::now();
+        let mut c = Core::new(Role::Client, opts, None, None, now).unwrap();
+        c.start_client(specs, now);
+        drain(&mut c);
+        c
+    }
+
+    fn welcomed(opts: Options, ext: &[&str]) -> Core {
+        let mut c = client(opts, &[]);
+        c.on_frame(ctl_frame(ctl::WELCOME, json!({ "version": PROTOCOL_VERSION, "extensions": ext })), Instant::now());
+        assert!(c.is_open());
+        c
+    }
+
+    fn multistream() -> Options {
+        Options { max_datagram: Some(1200), extensions: vec![QUIC_MULTISTREAM.into()], ..Options::default() }
+    }
+
+    /// Opens a channel and answers it with `ack` (the id is filled in). Returns what the core wrote.
+    fn open_and_ack(c: &mut Core, spec: ChannelSpec, mut ack: Value) -> (u16, Arc<Signals>, Vec<Frame>) {
+        let (id, sig, _rx) = c.open_channel(spec, Instant::now()).unwrap();
+        drain(c);
+        ack["id"] = json!(id);
+        c.on_frame(ctl_frame(ctl::CHANNEL_ACK, ack), Instant::now());
+        (id, sig, drain(c))
+    }
+
+    fn reliable_unordered(c: &mut Core) -> (u16, Arc<Signals>) {
+        let (id, sig, _) = open_and_ack(c, ChannelSpec::reliable("x"), json!({ "reliable": true, "ordered": true }));
+        // No path implemented here is reliable but unordered (see check_granted), so set it directly.
+        c.channels.get_mut(&id).unwrap().props = Properties { reliable: true, ordered: false };
+        (id, sig)
+    }
+
+    // C2: a reliable channel that can't fragment waits for credit for the whole message.
+    #[test]
+    fn a_reliable_unfragmentable_message_waits_for_enough_credit() {
+        let mut c = welcomed(Options::default(), &[]);
+        let (id, sig) = reliable_unordered(&mut c);
+        let mut left = c.channels[&id].send_credit;
+        while left > 1000 + 65536 {
+            c.send(id, &sig, 1, Bytes::from(vec![0u8; 65536])).unwrap();
+            left -= 65536;
+        }
+        c.send(id, &sig, 1, Bytes::from(vec![0u8; (left - 1000) as usize])).unwrap();
+        drain(&mut c);
+        assert_eq!(c.channels[&id].send_credit, 1000);
+
+        c.send(id, &sig, 1, Bytes::from(vec![0u8; 4000])).unwrap();
+        assert!(drain(&mut c).is_empty(), "1000 bytes of credit is not enough for 4000");
+        assert_eq!(c.channels[&id].send_credit, 1000);
+
+        let mut wu = id.to_be_bytes().to_vec();
+        wu.extend_from_slice(&2999u32.to_be_bytes());
+        c.on_frame(Frame::new(0, ctl::WINDOW_UPDATE, 0, wu.clone()), Instant::now());
+        assert!(drain(&mut c).is_empty(), "3999 is still not enough");
+        wu[2..].copy_from_slice(&1u32.to_be_bytes());
+        c.on_frame(Frame::new(0, ctl::WINDOW_UPDATE, 0, wu), Instant::now());
+        let out = drain(&mut c);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].payload.len(), out[0].flags), (4000, 0));
+        assert_eq!(c.channels[&id].send_credit, 0);
+    }
+
+    #[test]
+    fn an_unfragmentable_message_larger_than_the_initial_window_is_refused() {
+        let mut c = welcomed(Options::default(), &[]);
+        let (id, sig) = reliable_unordered(&mut c);
+        // Limits::valid() rules this out for a real peer; set it directly to check the guard.
+        c.remote.initial_window = 4096;
+        assert!(matches!(c.send(id, &sig, 1, Bytes::from(vec![0u8; 5000])), Err(Error::TooLarge { limit: 4096, .. })));
+    }
+
+    // H4: the answer may not report properties the channel's path doesn't have.
+    #[test]
+    fn an_ack_that_drops_ordering_closes_with_1002() {
+        let mut c = welcomed(Options::default(), &[]);
+        let (_, _, out) = open_and_ack(&mut c, ChannelSpec::reliable("x"), json!({ "reliable": true, "ordered": false }));
+        assert_eq!(close_code(&out), Some(1002));
+    }
+
+    #[test]
+    fn an_ack_that_drops_reliability_closes_with_1002() {
+        let mut c = welcomed(Options::default(), &[]);
+        let (_, _, out) = open_and_ack(&mut c, ChannelSpec::reliable("x"), json!({ "reliable": false, "ordered": false }));
+        assert_eq!(close_code(&out), Some(1002));
+    }
+
+    #[test]
+    fn an_unreliable_answer_on_the_base_path_closes_with_1002_even_if_requested() {
+        let mut c = welcomed(Options::default(), &[]);
+        let spec = ChannelSpec { reliable: false, ordered: false, ..ChannelSpec::reliable("x") };
+        let (_, _, out) = open_and_ack(&mut c, spec, json!({ "reliable": false, "ordered": false }));
+        assert_eq!(close_code(&out), Some(1002));
+    }
+
+    #[test]
+    fn an_unreliable_request_may_be_answered_reliable_on_the_base_path() {
+        let mut c = welcomed(Options::default(), &[]);
+        let (id, sig, out) = open_and_ack(&mut c, ChannelSpec::datagram("x"), json!({ "reliable": true, "ordered": true }));
+        assert!(out.is_empty());
+        assert_eq!(c.channel_props(id, &sig), Some(Properties { reliable: true, ordered: true }));
+    }
+
+    #[test]
+    fn a_datagram_placement_that_was_not_requested_closes_with_1002() {
+        let mut c = welcomed(multistream(), &[QUIC_MULTISTREAM]);
+        let (_, _, out) = open_and_ack(&mut c, ChannelSpec::reliable("x"), json!({ "reliable": false, "ordered": false, "quic": "datagram" }));
+        assert_eq!(close_code(&out), Some(1002));
+    }
+
+    #[test]
+    fn a_datagram_placement_without_the_extension_closes_with_1002() {
+        let mut c = welcomed(multistream(), &[]);
+        let (_, _, out) = open_and_ack(&mut c, ChannelSpec::datagram("x"), json!({ "reliable": false, "ordered": false, "quic": "datagram" }));
+        assert_eq!(close_code(&out), Some(1002));
+    }
+
+    #[test]
+    fn a_datagram_placement_must_report_the_datagram_properties() {
+        let mut c = welcomed(multistream(), &[QUIC_MULTISTREAM]);
+        let (_, _, out) = open_and_ack(&mut c, ChannelSpec::datagram("x"), json!({ "reliable": true, "ordered": false, "quic": "datagram" }));
+        assert_eq!(close_code(&out), Some(1002));
+    }
+
+    #[test]
+    fn a_requested_datagram_placement_is_accepted() {
+        let mut c = welcomed(multistream(), &[QUIC_MULTISTREAM]);
+        let (id, sig, out) = open_and_ack(&mut c, ChannelSpec::datagram("x"), json!({ "reliable": false, "ordered": false, "quic": "datagram" }));
+        assert!(out.is_empty());
+        assert_eq!(c.channel_props(id, &sig), Some(Properties { reliable: false, ordered: false }));
+        assert!(c.channels[&id].datagram);
+    }
+
+    #[test]
+    fn a_welcome_entry_that_drops_reliability_closes_with_1002() {
+        let mut c = client(Options::default(), &[ChannelSpec::reliable("a")]);
+        let welcome = json!({ "version": PROTOCOL_VERSION, "channels": [{ "id": 1, "reliable": false, "ordered": true }] });
+        c.on_frame(ctl_frame(ctl::WELCOME, welcome), Instant::now());
+        assert_eq!(close_code(&drain(&mut c)), Some(1002));
+    }
+
+    #[test]
+    fn a_welcome_entry_on_the_base_path_is_accepted() {
+        let mut c = client(Options::default(), &[ChannelSpec::reliable("a")]);
+        let welcome = json!({ "version": PROTOCOL_VERSION, "channels": [{ "id": 1, "reliable": true, "ordered": true }] });
+        c.on_frame(ctl_frame(ctl::WELCOME, welcome), Instant::now());
+        assert!(c.is_open());
+        assert!(drain(&mut c).is_empty());
+    }
+
+    // H1: PONGs count against the control budget.
+    fn server(max_control_queue: usize) -> Core {
+        let opts = Options { max_control_queue, ..Options::default() };
+        let mut c = Core::new(Role::Server, opts, None, None, Instant::now()).unwrap();
+        c.on_frame(ctl_frame(ctl::HELLO, json!({ "version": PROTOCOL_VERSION })), Instant::now());
+        drain(&mut c); // WELCOME
+        c
+    }
+
+    #[test]
+    fn pongs_nobody_reads_close_with_4004() {
+        let mut c = server(4096);
+        for i in 0..10_000u32 {
+            c.on_frame(Frame::new(0, PING, PROBE, i.to_be_bytes().to_vec()), Instant::now());
+        }
+        assert!(c.probes_out.len() * 12 <= 4096, "{} PONGs queued", c.probes_out.len());
+        assert_eq!(close_code(&drain(&mut c)), Some(u64::from(code::RATE_LIMITED)));
+    }
+
+    #[test]
+    fn pongs_that_are_written_free_their_budget() {
+        let mut c = server(4096);
+        for i in 0..10_000u32 {
+            c.on_frame(Frame::new(0, PING, PROBE, i.to_be_bytes().to_vec()), Instant::now());
+            if i % 100 == 99 {
+                assert_eq!(drain(&mut c).len(), 100);
+            }
+        }
+        assert!(c.is_open());
+        assert!(c.probes_out.is_empty());
+    }
+
+    // take_grants: one ID can need several entries, and the frame must still fit channel 0.
+    #[test]
+    fn window_updates_never_exceed_the_control_limit() {
+        let mut c = welcomed(Options::default(), &[]);
+        let per_id = 3 * MAX_CREDIT;
+        let ids: Vec<u16> = (1..=WINDOW_ENTRIES_PER_FRAME as u16).map(|i| i * 2 + 1).collect();
+        for id in &ids {
+            c.grants.insert(*id, per_id);
+        }
+        let mut total: HashMap<u16, u64> = HashMap::new();
+        let mut frames = 0;
+        for f in drain(&mut c) {
+            assert_eq!(f.ty, ctl::WINDOW_UPDATE);
+            assert!(f.payload.len() <= CONTROL_MAX as usize, "{} bytes", f.payload.len());
+            for e in f.payload.as_chunks::<6>().0 {
+                let inc = u64::from(u32::from_be_bytes([e[2], e[3], e[4], e[5]]));
+                assert!((1..=MAX_CREDIT).contains(&inc));
+                *total.entry(u16::from_be_bytes([e[0], e[1]])).or_insert(0) += inc;
+            }
+            frames += 1;
+        }
+        assert_eq!(frames, 3);
+        assert_eq!(total.len(), ids.len());
+        assert!(total.values().all(|v| *v == per_id));
+    }
+
+    // M1: datagrams held before the answer are replayed as datagrams.
+    #[test]
+    fn a_held_datagram_is_dropped_if_the_channel_lands_on_the_session_stream() {
+        let mut c = welcomed(multistream(), &[QUIC_MULTISTREAM]);
+        let (id, _sig, _rx) = c.open_channel(ChannelSpec::datagram("v"), Instant::now()).unwrap();
+        drain(&mut c);
+        c.on_datagram(Frame::new(id, 7, 0, b"stray".to_vec()), Instant::now());
+        c.on_frame(ctl_frame(ctl::CHANNEL_ACK, json!({ "id": id, "reliable": true, "ordered": true, "quic": "session" })), Instant::now());
+        assert!(c.is_open());
+        assert!(c.channels[&id].recv.is_empty(), "a datagram must not be delivered on a stream channel");
     }
 }
