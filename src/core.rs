@@ -370,6 +370,13 @@ pub(crate) struct Accepted {
     pub sig: Arc<Signals>,
 }
 
+#[derive(Clone)]
+pub(crate) struct Deferred {
+    pub id: u16,
+    pub spec: ChannelSpec,
+    pub sig: Arc<Signals>,
+}
+
 pub struct Core {
     role: Role,
     phase: Phase,
@@ -377,6 +384,10 @@ pub struct Core {
     remote: Limits,
     policy: Option<Policy>,
     authorize: Option<Authorize>,
+    pub(crate) deferred_profiles: BTreeSet<String>,
+    deferred: BTreeMap<u16, Deferred>,
+    deferred_queue: VecDeque<u16>,
+    pub(crate) wake_deferred: Arc<Notify>,
     channels: BTreeMap<u16, Chan>,
     ctrl_out: VecDeque<Frame>,
     ctrl_bytes: usize,
@@ -536,6 +547,10 @@ impl Core {
             remote: Limits::default(),
             policy,
             authorize,
+            deferred_profiles: BTreeSet::new(),
+            deferred: BTreeMap::new(),
+            deferred_queue: VecDeque::new(),
+            wake_deferred: Arc::new(Notify::new()),
             channels: BTreeMap::new(),
             ctrl_out: VecDeque::new(),
             ctrl_bytes: 0,
@@ -912,6 +927,11 @@ impl Core {
                 None
             } else if h.accepted >= self.opts.max_channels {
                 h.answers.push(None);
+                continue;
+            } else if h.specs[h.answers.len()].1.metadata.as_ref()
+                .and_then(|m| m.get("profile")).and_then(Value::as_str)
+                .is_some_and(|p| self.deferred_profiles.contains(p)) {
+                h.answers.push(Some(Err(Refusal::new(code::UNSUPPORTED, "open this profile after WELCOME"))));
                 continue;
             } else {
                 match &self.policy {
@@ -1487,11 +1507,11 @@ impl Core {
     fn on_open_channel(&mut self, payload: &[u8], now: Instant) -> std::result::Result<(), Refusal> {
         let o = parse_object(payload)?;
         let (id, spec) = parse_spec(&o)?;
-        if id == 0 || id >= u64::from(RESERVED_CHANNEL) || id % 2 != self.peer_parity() || self.channels.contains_key(&(id as u16)) {
+        if id == 0 || id >= u64::from(RESERVED_CHANNEL) || id % 2 != self.peer_parity() || self.channels.contains_key(&(id as u16)) || self.deferred.contains_key(&(id as u16)) {
             return Err(Refusal::new(code::PROTOCOL_ERROR, "bad channel ID in OPEN_CHANNEL"));
         }
         let id = id as u16;
-        let peer_opened = self.channels.keys().filter(|i| u64::from(**i) % 2 == self.peer_parity()).count();
+        let peer_opened = self.channels.keys().filter(|i| u64::from(**i) % 2 == self.peer_parity()).count() + self.deferred.len();
         if peer_opened >= self.opts.max_channels {
             self.queue_ctrl(ctl::CHANNEL_REJECT, &json!({ "id": id, "code": code::CHANNEL_LIMIT, "reason": "too many channels" }), now);
             return Ok(());
@@ -1510,16 +1530,64 @@ impl Core {
     fn open_decided(&mut self, id: u16, spec: ChannelSpec, answer: std::result::Result<(), Refusal>, now: Instant) {
         match answer {
             Ok(()) => {
-                let sig = self.insert_channel(id, ChanState::Open, now);
-                let ack = self.accept_path(id, &spec);
-                self.queue_ctrl(ctl::CHANNEL_ACK, &ack, now);
-                self.accepted.push_back(Accepted { id, spec, sig });
-                self.wake_accept.notify_waiters();
+                let defer = spec.metadata.as_ref().and_then(|m| m.get("profile")).and_then(Value::as_str)
+                    .is_some_and(|p| self.deferred_profiles.contains(p));
+                if defer {
+                    self.deferred.insert(id, Deferred { id, spec, sig: new_signals() });
+                    self.deferred_queue.push_back(id);
+                    self.wake_deferred.notify_waiters();
+                } else if let Ok(accepted) = self.admit_channel(id, spec, now) {
+                    self.accepted.push_back(accepted);
+                    self.wake_accept.notify_waiters();
+                }
             }
             Err(r) => {
                 self.queue_ctrl(ctl::CHANNEL_REJECT, &json!({ "id": id, "code": r.code, "reason": r.reason }), now);
             }
         }
+    }
+
+    fn admit_channel(&mut self, id: u16, spec: ChannelSpec, now: Instant) -> Result<Accepted> {
+        let sig = self.insert_channel(id, ChanState::Open, now);
+        let ack = self.accept_path(id, &spec);
+        self.queue_ctrl(ctl::CHANNEL_ACK, &ack, now);
+        if self.is_ended() {
+            return Err(self.closed_error());
+        }
+        Ok(Accepted { id, spec, sig })
+    }
+
+    pub(crate) fn take_deferred(&mut self) -> Option<Deferred> {
+        while let Some(id) = self.deferred_queue.pop_front() {
+            if let Some(request) = self.deferred.get(&id) {
+                return Some(request.clone());
+            }
+        }
+        None
+    }
+
+    pub(crate) fn decide_deferred(&mut self, id: u16, sig: &Arc<Signals>, answer: std::result::Result<(), Refusal>, now: Instant) -> Result<Option<Accepted>> {
+        if self.phase != Phase::Open {
+            return Err(self.closed_error());
+        }
+        if !self.deferred.get(&id).is_some_and(|r| Arc::ptr_eq(&r.sig, sig)) {
+            return Err(Error::Invalid("admission already settled"));
+        }
+        let request = self.deferred.remove(&id).expect("matched admission");
+        self.deferred_queue.retain(|queued| *queued != id);
+        Self::end_deferred(&request, CloseInfo { code: code::NORMAL, reason: "admission settled".into() });
+        match answer {
+            Ok(()) => self.admit_channel(id, request.spec, now).map(Some),
+            Err(r) => {
+                self.queue_ctrl(ctl::CHANNEL_REJECT, &json!({ "id": id, "code": r.code, "reason": r.reason }), now);
+                Ok(None)
+            }
+        }
+    }
+
+    fn end_deferred(request: &Deferred, info: CloseInfo) {
+        *request.sig.finished.lock().unwrap() = Some(Finished { recv: VecDeque::new(), info, stats: ProbeStats::default() });
+        request.sig.closed.notify_waiters();
     }
 
     fn opening_channel(&self, id: u64) -> std::result::Result<u16, Refusal> {
@@ -1779,6 +1847,10 @@ impl Core {
         self.asked = None;
         self.accepted.clear();
         let info = self.close_info.clone().unwrap_or(CloseInfo { code: code::GOING_AWAY, reason: String::new() });
+        for (_, request) in std::mem::take(&mut self.deferred) {
+            Self::end_deferred(&request, info.clone());
+        }
+        self.deferred_queue.clear();
         let ids: Vec<u16> = self.channels.keys().copied().collect();
         for id in ids {
             self.abort_sends_with(id, Error::Closed(info.clone()));
@@ -1806,6 +1878,7 @@ impl Core {
         }
         self.handshake_done.notify_waiters();
         self.wake_accept.notify_waiters();
+        self.wake_deferred.notify_waiters();
     }
 
     fn finish(&mut self) {
@@ -2369,6 +2442,100 @@ impl Core {
 
     pub(crate) fn is_ended(&self) -> bool {
         self.phase != Phase::Open && self.phase != Phase::Handshake
+    }
+}
+
+#[cfg(test)]
+mod deferred_tests {
+    use super::*;
+
+    fn frame(ty: u8, value: Value) -> Frame {
+        Frame::new(0, ty, 0, serde_json::to_vec(&value).unwrap())
+    }
+
+    fn drain(core: &mut Core) -> Vec<Frame> {
+        let (mut frames, mut done) = (Vec::new(), Vec::new());
+        while let Some(frame) = core.next_frame(&mut done) {
+            frames.push(frame);
+        }
+        frames
+    }
+
+    fn connected(limit: usize) -> Core {
+        let options = Options { max_channels: limit, ..Options::default() };
+        let mut core = Core::new(Role::Server, options, Some(Arc::new(|_| Ok(()))), None, Instant::now()).unwrap();
+        core.deferred_profiles.insert("pipe/1".into());
+        core.on_frame(frame(ctl::HELLO, json!({"version": PROTOCOL_VERSION})), Instant::now());
+        core.run_decisions(Instant::now());
+        drain(&mut core);
+        core
+    }
+
+    fn open(core: &mut Core, id: u16) {
+        core.on_frame(frame(ctl::OPEN_CHANNEL, json!({"id": id, "name": "pipe", "reliable": true, "ordered": true, "metadata": {"profile": "pipe/1"}})), Instant::now());
+        core.run_decisions(Instant::now());
+    }
+
+    #[test]
+    fn policy_refusal_never_reserves_a_deferred_endpoint() {
+        let mut core = connected(1);
+        core.policy = Some(Arc::new(|_| Err(Refusal::new(code::CHANNEL_REFUSED, "not allowed"))));
+        open(&mut core, 1);
+        let frames = drain(&mut core);
+        assert_eq!(frames[0].ty, ctl::CHANNEL_REJECT);
+        assert!(core.deferred.is_empty() && core.deferred_queue.is_empty());
+    }
+
+    #[test]
+    fn pending_ids_are_reserved_before_capacity_checks() {
+        let mut core = connected(1);
+        open(&mut core, 1);
+        assert!(drain(&mut core).is_empty());
+        open(&mut core, 3);
+        let refusal: Value = serde_json::from_slice(&drain(&mut core)[0].payload).unwrap();
+        assert_eq!(refusal["code"], code::CHANNEL_LIMIT);
+        open(&mut core, 1);
+        assert_eq!(core.close_info().unwrap().code, code::PROTOCOL_ERROR, "duplicate pending ID is a protocol error, not a capacity refusal");
+    }
+
+    #[test]
+    fn stale_admission_identity_cannot_settle_reused_id() {
+        let mut core = connected(1);
+        open(&mut core, 1);
+        let old = core.take_deferred().unwrap();
+        core.decide_deferred(1, &old.sig, Err(Refusal::new(code::CHANNEL_REFUSED, "no")), Instant::now()).unwrap();
+        drain(&mut core);
+        open(&mut core, 1);
+        let current = core.take_deferred().unwrap();
+        assert!(core.decide_deferred(1, &old.sig, Ok(()), Instant::now()).is_err());
+        assert!(drain(&mut core).is_empty());
+        assert!(core.decide_deferred(1, &current.sig, Ok(()), Instant::now()).unwrap().is_some());
+        assert_eq!(drain(&mut core)[0].ty, ctl::CHANNEL_ACK);
+    }
+
+    #[test]
+    fn frames_before_admission_are_not_buffered_or_delivered() {
+        let mut core = connected(2);
+        open(&mut core, 1);
+        let pending = core.take_deferred().unwrap();
+        core.on_frame(Frame::new(1, 1, 0, Bytes::from_static(b"too early")), Instant::now());
+        core.on_frame(Frame::new(1, PING, PROBE, Bytes::from_static(b"ping")), Instant::now());
+        core.on_frame(frame(ctl::CLOSE_CHANNEL, json!({"id": 1})), Instant::now());
+        assert!(drain(&mut core).is_empty());
+        let accepted = core.decide_deferred(1, &pending.sig, Ok(()), Instant::now()).unwrap().unwrap();
+        assert!(core.receive(1, &accepted.sig, Instant::now()).is_none());
+        assert_eq!(drain(&mut core).len(), 1, "only the admission ACK is emitted");
+    }
+
+    #[test]
+    fn session_end_retires_pending_admissions_and_refuses_late_accept() {
+        let mut core = connected(1);
+        open(&mut core, 1);
+        let pending = core.take_deferred().unwrap();
+        core.close(code::GOING_AWAY, "done", Instant::now());
+        assert!(pending.sig.finished.lock().unwrap().is_some());
+        assert!(core.decide_deferred(1, &pending.sig, Ok(()), Instant::now()).is_err());
+        assert!(core.deferred.is_empty() && core.deferred_queue.is_empty());
     }
 }
 
