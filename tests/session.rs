@@ -259,6 +259,15 @@ async fn pipe_eof_waits_until_previous_bytes_are_consumed() {
 }
 
 #[tokio::test]
+async fn pipe_channel_close_without_eof_is_not_successful_end_of_stream() {
+    let (s, c) = pair().await;
+    let a = c.open_channel(pipe::spec("p", None)).await.unwrap();
+    let b = Pipe::new(s.accept_channel().await.unwrap()).unwrap();
+    a.close(code::NORMAL, None).await;
+    assert!(b.read().await.is_err(), "a close without EOF does not confirm a complete byte stream");
+}
+
+#[tokio::test]
 async fn pipe_rejects_nonempty_eof() {
     let (s, c) = pair().await;
     let a = c.open_channel(pipe::spec("p", None)).await.unwrap();

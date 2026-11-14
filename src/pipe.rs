@@ -77,7 +77,7 @@ impl Pipe {
             return self.finish_read().await;
         }
         let Some(m) = self.ch.receive().await? else {
-            return Ok(None);
+            return Err(Error::Invalid("pipe closed without EOF"));
         };
         match m.ty {
             DATA => {
