@@ -230,7 +230,96 @@ async fn a_pipe_carries_bytes_with_half_close_and_backpressure() {
     b.write(Bytes::from_static(b"reply")).await.unwrap();
     b.write_eof().await.unwrap();
     assert_eq!(&a.read().await.unwrap().unwrap()[..], b"reply");
+    a.consumed(b"reply".len());
     assert!(a.read().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn pipe_write_after_eof_is_refused_without_sending_data() {
+    let (s, c) = pair().await;
+    let a = Pipe::new(c.open_channel(pipe::spec("p", None)).await.unwrap()).unwrap();
+    let b = s.accept_channel().await.unwrap();
+    a.write_eof().await.unwrap();
+    assert_eq!(b.receive().await.unwrap().unwrap().ty, pipe::EOF);
+    assert!(a.write(Bytes::from_static(b"too late")).await.is_err());
+    assert!(tokio::time::timeout(Duration::from_millis(30), b.receive()).await.is_err());
+}
+
+#[tokio::test]
+async fn pipe_eof_waits_until_previous_bytes_are_consumed() {
+    let (s, c) = pair().await;
+    let a = Pipe::new(c.open_channel(pipe::spec("p", None)).await.unwrap()).unwrap();
+    let b = Pipe::new(s.accept_channel().await.unwrap()).unwrap();
+    a.write(Bytes::from_static(b"drain me")).await.unwrap();
+    a.write_eof().await.unwrap();
+    let data = b.read().await.unwrap().unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(30), b.read()).await.is_err(), "EOF must not take effect before the local write");
+    b.consumed(data.len());
+    assert!(tokio::time::timeout(Duration::from_secs(1), b.read()).await.unwrap().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn pipe_channel_close_without_eof_is_not_successful_end_of_stream() {
+    let (s, c) = pair().await;
+    let a = c.open_channel(pipe::spec("p", None)).await.unwrap();
+    let b = Pipe::new(s.accept_channel().await.unwrap()).unwrap();
+    a.close(code::NORMAL, None).await;
+    assert!(b.read().await.is_err(), "a close without EOF does not confirm a complete byte stream");
+}
+
+#[tokio::test]
+async fn pipe_rejects_nonempty_eof() {
+    let (s, c) = pair().await;
+    let a = c.open_channel(pipe::spec("p", None)).await.unwrap();
+    let b = Pipe::new(s.accept_channel().await.unwrap()).unwrap();
+    a.send(pipe::EOF, Bytes::from_static(b"not empty")).await.unwrap();
+    assert!(b.read().await.is_err());
+}
+
+#[tokio::test]
+async fn pipe_read_does_not_close_before_queued_eof_is_sent() {
+    for cancel_writer in [true, false] {
+        let (s, c) = pair().await;
+        let a = Pipe::new(c.open_channel(pipe::spec("p", None)).await.unwrap()).unwrap();
+        let b = s.accept_channel().await.unwrap();
+        b.send(pipe::EOF, Bytes::new()).await.unwrap();
+        assert!(a.read().await.unwrap().is_none());
+        let mut eof = Box::pin(a.write_eof());
+        // Queue EOF without allowing the transport task to send it yet.
+        std::future::poll_fn(|cx| {
+            assert!(eof.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        }).await;
+        if cancel_writer {
+            drop(eof);
+            assert!(a.write(Bytes::from_static(b"after EOF")).await.is_err());
+            assert!(a.read().await.unwrap().is_none());
+        } else {
+            let (received, sent) = tokio::join!(biased; a.read(), eof);
+            assert!(received.unwrap().is_none());
+            sent.unwrap();
+        }
+        assert_eq!(b.receive().await.unwrap().unwrap().ty, pipe::EOF, "the committed EOF must reach the peer even after caller cancellation");
+    }
+}
+
+#[tokio::test]
+async fn pipe_local_write_queue_survives_the_close_exchange() {
+    let (s, c) = pair().await;
+    let a = Pipe::new(c.open_channel(pipe::spec("p", None)).await.unwrap()).unwrap();
+    let b = Pipe::new(s.accept_channel().await.unwrap()).unwrap();
+    a.write(Bytes::from_static(b"still owned")).await.unwrap();
+    a.write_eof().await.unwrap();
+    let queued = b.read().await.unwrap().unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(30), b.read()).await.is_err());
+    let (sent, received) = tokio::join!(b.write_eof(), a.read());
+    sent.unwrap();
+    assert!(received.unwrap().is_none());
+    b.channel().closed().await;
+    assert!(tokio::time::timeout(Duration::from_millis(30), b.read()).await.is_err(), "channel close must not discard the pending local write");
+    assert_eq!(&queued[..], b"still owned");
+    b.consumed(queued.len());
+    assert!(b.read().await.unwrap().is_none());
 }
 
 #[tokio::test]
