@@ -17,4 +17,4 @@ pub mod ws;
 
 pub use crate::core::{ChannelSpec, Limits, Message, Options, ProbeStats, Properties, Refusal};
 pub use crate::error::{CloseInfo, Error, Result};
-pub use crate::session::{Acceptor, Channel, Incoming, MessageReader, MessageWriter, Session};
+pub use crate::session::{Acceptor, Channel, Incoming, MessageReader, MessageWriter, PendingChannel, Session};

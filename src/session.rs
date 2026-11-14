@@ -1,5 +1,5 @@
 //! The tokio driver: runs a [`Core`] over a byte stream, and the handles applications use.
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -130,9 +130,23 @@ impl Drop for SessionHandle {
 pub struct Acceptor {
     pub policy: Option<Policy>,
     pub authorize: Option<Authorize>,
+    /// Profiles whose post-handshake opens need application admission before ACK.
+    pub deferred_profiles: Vec<String>,
 }
 
 impl Acceptor {
+    /// Defer successful policy decisions for this profile to [`Session::accept_pending_channel`].
+    /// Requests for a deferred profile in HELLO are refused with 1003; open them after WELCOME.
+    pub fn defer_profile(mut self, profile: &str) -> Self {
+        self.deferred_profiles.push(profile.into());
+        self
+    }
+
+    pub(crate) fn core(self, role: Role, opts: Options, now: Instant) -> Result<Core> {
+        let mut core = Core::new(role, opts, self.policy, self.authorize, now)?;
+        core.deferred_profiles.extend(self.deferred_profiles);
+        Ok(core)
+    }
     pub fn policy(mut self, f: impl Fn(&ChannelSpec) -> std::result::Result<(), Refusal> + Send + Sync + 'static) -> Self {
         self.policy = Some(Arc::new(f));
         self
@@ -144,6 +158,69 @@ impl Acceptor {
     ) -> Self {
         self.authorize = Some(Arc::new(f));
         self
+    }
+}
+
+/// A peer's channel request awaiting application admission. It reserves channel capacity but has
+/// not been acknowledged. Dropping it rejects the open with 4010. It does not keep the session alive.
+pub struct PendingChannel {
+    session: Weak<SessionHandle>,
+    request: crate::core::Deferred,
+    armed: bool,
+}
+
+impl PendingChannel {
+    pub fn spec(&self) -> &ChannelSpec {
+        &self.request.spec
+    }
+
+    /// Accept after the local endpoint is ready. ACK and handle publication are atomic with respect
+    /// to session shutdown. The returned channel is not also queued by `accept_channel`.
+    pub fn accept(mut self) -> Result<Channel> {
+        let handle = self.session.upgrade().ok_or(Error::Invalid("admission session ended"))?;
+        let result = handle.shared.lock().decide_deferred(self.request.id, &self.request.sig, Ok(()), Instant::now());
+        self.armed = false;
+        handle.shared.wake_writer.notify_one();
+        let accepted = result?.ok_or(Error::Invalid("admission refused"))?;
+        Ok(Channel::new(Session { handle }, accepted.id, accepted.sig, accepted.spec))
+    }
+
+    pub fn reject(mut self, refusal: Refusal) -> Result<()> {
+        let result = self.refuse(refusal);
+        self.armed = false;
+        result
+    }
+
+    fn refuse(&self, refusal: Refusal) -> Result<()> {
+        let handle = self.session.upgrade().ok_or(Error::Invalid("admission session ended"))?;
+        let result = handle.shared.lock().decide_deferred(self.request.id, &self.request.sig, Err(refusal), Instant::now());
+        handle.shared.wake_writer.notify_one();
+        result.map(|_| ())
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.request.sig.finished.lock().unwrap().is_some()
+    }
+
+    /// Wait for session shutdown or admission retirement. Use this to cancel endpoint setup.
+    pub async fn closed(&self) {
+        loop {
+            let closed = self.request.sig.closed.notified();
+            tokio::pin!(closed);
+            closed.as_mut().enable();
+            if self.is_closed() {
+                return;
+            }
+            closed.await;
+        }
+    }
+}
+
+impl Drop for PendingChannel {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.refuse(Refusal::new(crate::frame::code::CHANNEL_REFUSED, "admission abandoned"));
+        }
     }
 }
 
@@ -169,7 +246,7 @@ impl Session {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let core = Core::new(Role::Server, opts, acceptor.policy, acceptor.authorize, Instant::now())?;
+        let core = acceptor.core(Role::Server, opts, Instant::now())?;
         let s = Session::spawn(core, reader, writer);
         s.finish_handshake().await?;
         Ok(s)
@@ -189,7 +266,7 @@ impl Session {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let now = Instant::now();
-        let mut core = Core::new(Role::Client, opts, acceptor.policy, acceptor.authorize, now)?;
+        let mut core = acceptor.core(Role::Client, opts, now)?;
         let opened = core.start_client(&channels, now)?;
         let waits: Vec<_> = opened
             .iter()
@@ -244,7 +321,7 @@ impl Session {
 
     /// Runs the server side on a message pipe: one frame per message, no magic (WebSocket, WebRTC).
     pub async fn accept_messages<R: MessageReader, W: MessageWriter>(reader: R, writer: W, opts: Options, acceptor: Acceptor) -> Result<Session> {
-        let core = Core::new(Role::Server, opts, acceptor.policy, acceptor.authorize, Instant::now())?;
+        let core = acceptor.core(Role::Server, opts, Instant::now())?;
         let s = Session::spawn_messages(core, reader, writer);
         s.finish_handshake().await?;
         Ok(s)
@@ -259,7 +336,7 @@ impl Session {
         channels: Vec<ChannelSpec>,
     ) -> Result<(Session, Vec<Result<Channel>>)> {
         let now = Instant::now();
-        let mut core = Core::new(Role::Client, opts, acceptor.policy, acceptor.authorize, now)?;
+        let mut core = acceptor.core(Role::Client, opts, now)?;
         let opened = core.start_client(&channels, now)?;
         let waits: Vec<_> = opened
             .iter()
@@ -335,6 +412,28 @@ impl Session {
                 let mut core = self.shared().lock();
                 if let Some(a) = core.take_accepted() {
                     return Some(Channel::new(self.clone(), a.id, a.sig, a.spec));
+                }
+                if core.is_ended() {
+                    return None;
+                }
+            }
+            waiting.await;
+        }
+    }
+
+    /// The next deferred open. Ordinary accepted channels remain on [`Session::accept_channel`].
+    /// Pending requests count against `max_channels`; callers must bound endpoint setup and settle
+    /// or drop each handle. Session shutdown retires queued and handed-out requests.
+    pub async fn accept_pending_channel(&self) -> Option<PendingChannel> {
+        loop {
+            let notify = self.shared().lock().wake_deferred.clone();
+            let waiting = notify.notified();
+            tokio::pin!(waiting);
+            waiting.as_mut().enable();
+            {
+                let mut core = self.shared().lock();
+                if let Some(request) = core.take_deferred() {
+                    return Some(PendingChannel { session: Arc::downgrade(&self.handle), request, armed: true });
                 }
                 if core.is_ended() {
                     return None;
