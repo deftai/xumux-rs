@@ -268,6 +268,33 @@ async fn pipe_rejects_nonempty_eof() {
 }
 
 #[tokio::test]
+async fn pipe_read_does_not_close_before_queued_eof_is_sent() {
+    for cancel_writer in [true, false] {
+        let (s, c) = pair().await;
+        let a = Pipe::new(c.open_channel(pipe::spec("p", None)).await.unwrap()).unwrap();
+        let b = s.accept_channel().await.unwrap();
+        b.send(pipe::EOF, Bytes::new()).await.unwrap();
+        assert!(a.read().await.unwrap().is_none());
+        let mut eof = Box::pin(a.write_eof());
+        // Queue EOF without allowing the transport task to send it yet.
+        std::future::poll_fn(|cx| {
+            assert!(eof.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        }).await;
+        if cancel_writer {
+            drop(eof);
+            assert!(a.write(Bytes::from_static(b"after EOF")).await.is_err());
+            assert!(a.read().await.unwrap().is_none());
+        } else {
+            let (received, sent) = tokio::join!(biased; a.read(), eof);
+            assert!(received.unwrap().is_none());
+            sent.unwrap();
+        }
+        assert_eq!(b.receive().await.unwrap().unwrap().ty, pipe::EOF, "the committed EOF must reach the peer even after caller cancellation");
+    }
+}
+
+#[tokio::test]
 async fn pipe_local_write_queue_survives_the_close_exchange() {
     let (s, c) = pair().await;
     let a = Pipe::new(c.open_channel(pipe::spec("p", None)).await.unwrap()).unwrap();

@@ -2,6 +2,7 @@
 use bytes::Bytes;
 use serde_json::{json, Value};
 use std::sync::Mutex;
+use std::{future::Future, pin::Pin};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::core::ChannelSpec;
@@ -31,7 +32,14 @@ pub struct Pipe {
     state: Mutex<PipeState>,
     reader: AsyncMutex<()>,
     writer: AsyncMutex<()>,
+    eof_send: AsyncMutex<EofSend>,
     drained: Notify,
+}
+
+enum EofSend {
+    New,
+    Pending(Pin<Box<dyn Future<Output = Result<()>> + Send>>),
+    Done(Result<()>),
 }
 
 #[derive(Default)]
@@ -52,6 +60,7 @@ impl Pipe {
             state: Mutex::new(PipeState::default()),
             reader: AsyncMutex::new(()),
             writer: AsyncMutex::new(()),
+            eof_send: AsyncMutex::new(EofSend::New),
             drained: Notify::new(),
         })
     }
@@ -116,6 +125,7 @@ impl Pipe {
         }
         let both = self.state.lock().unwrap().sent_eof;
         if both {
+            self.finish_eof_send().await?;
             self.ch.close(code::NORMAL, None).await;
         }
         Ok(None)
@@ -152,20 +162,32 @@ impl Pipe {
     /// Half-close: no more data from this side, like TCP FIN.
     pub async fn write_eof(&self) -> Result<()> {
         let _writer = self.writer.lock().await;
-        {
-            let mut state = self.state.lock().unwrap();
-            if state.sent_eof {
-                return Ok(());
-            }
-            // send queues before awaiting transport completion, so cancellation cannot undo EOF.
-            state.sent_eof = true;
-        }
-        self.ch.send(EOF, Bytes::new()).await?;
+        self.state.lock().unwrap().sent_eof = true;
+        self.finish_eof_send().await?;
         let both = self.state.lock().unwrap().recv_eof;
         if both {
             self.ch.close(code::NORMAL, None).await;
         }
         Ok(())
+    }
+
+    // Keep the actual send future in the Pipe, rather than the caller's write_eof future. A
+    // cancelled writer cannot lose completion, and a reader must finish this send before CLOSE
+    // can discard queued messages. Dropping the Pipe drops the send and its channel clone too.
+    async fn finish_eof_send(&self) -> Result<()> {
+        let mut send = self.eof_send.lock().await;
+        if matches!(*send, EofSend::New) {
+            let ch = self.ch.clone();
+            *send = EofSend::Pending(Box::pin(async move { ch.send(EOF, Bytes::new()).await }));
+        }
+        if let EofSend::Pending(pending) = &mut *send {
+            let result = pending.await;
+            *send = EofSend::Done(result);
+        }
+        match &*send {
+            EofSend::Done(result) => result.clone(),
+            _ => unreachable!("EOF send completed"),
+        }
     }
 
     pub async fn reset(&self, c: u16, reason: &str) -> Result<()> {
