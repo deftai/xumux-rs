@@ -26,7 +26,7 @@ while let Some(pending) = session.accept_pending_channel().await {
 
 The synchronous policy still runs first, outside the core lock. Keep it quick: it decides authorization and validates metadata; deferred admission is the separate stage that may await endpoint setup. A policy refusal never becomes a pending request. Profiles are selected by their exact `metadata.profile` string; call `defer_profile` repeatedly to select more than one.
 
-Selected profiles are refused with `1003` if requested in HELLO. Open them after WELCOME instead. Other HELLO channels and profiles keep their existing synchronous behavior. This opt-in applies to byte streams, WebSocket, QUIC and WebTransport through the same core.
+Selected profiles are refused with `1003` if requested in HELLO. Open them after WELCOME instead. Other HELLO channels and profiles keep their existing synchronous behavior. This opt-in applies to byte streams, WebSocket, QUIC and WebTransport through the same core. It works on either peer: pass the configured `Acceptor` to `Session::connect` (or the client-side transport constructor) to defer host-initiated reverse channels until the client's local endpoint is ready.
 
 `PendingChannel::accept` queues ACK and returns the admitted channel. It does not also enqueue that channel on `Session::accept_channel`. `reject` supplies a refusal, and dropping an unsettled handle rejects with `4010`. Both queued requests and handed-out handles count against `Options::max_channels`; capacity remains reserved until the request is settled or the session ends. Apply a finite setup deadline and bound concurrent endpoint tasks in the application.
 
