@@ -50,9 +50,16 @@ struct PipeState {
 }
 
 impl Pipe {
+    /// Wrap a live pipe/1 channel whose request and effective path are reliable and ordered.
     pub fn new(ch: Channel) -> Result<Pipe> {
         if ch.profile() != Some(PROFILE) {
             return Err(Error::Invalid("not a pipe/1 channel"));
+        }
+        if !ch.properties().is_some_and(|p| p.reliable && p.ordered) {
+            return Err(Error::Invalid("pipe requires a live reliable ordered channel"));
+        }
+        if !ch.spec().reliable || !ch.spec().ordered {
+            return Err(Error::Invalid("pipe request must be reliable and ordered"));
         }
         ch.set_manual_credit(true);
         Ok(Pipe {

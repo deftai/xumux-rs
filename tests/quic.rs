@@ -60,6 +60,16 @@ async fn the_session_stream_carries_reliable_channels_of_any_size() {
 }
 
 #[tokio::test]
+async fn pipe_cannot_wrap_an_unreliable_unordered_datagram_channel() {
+    let (s, c, _a, _b) = pair().await;
+    let tx = c.open_channel(ChannelSpec::datagram("invalid-pipe").profile(xumux::pipe::PROFILE)).await.unwrap();
+    let rx = s.accept_channel().await.unwrap();
+    assert!(!tx.properties().unwrap().reliable && !tx.properties().unwrap().ordered);
+    assert!(xumux::pipe::Pipe::new(tx).is_err());
+    assert!(xumux::pipe::Pipe::new(rx).is_err());
+}
+
+#[tokio::test]
 async fn a_datagram_channel_is_unreliable_and_carries_messages() {
     let (s, c, _a, _b) = pair().await;
     let tx = c.open_channel(ChannelSpec::datagram("pointer")).await.unwrap();

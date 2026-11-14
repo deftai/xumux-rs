@@ -196,6 +196,32 @@ async fn keepalive_notices_a_silent_peer() {
 }
 
 #[tokio::test]
+async fn pipe_does_not_wrap_a_channel_that_has_already_closed() {
+    let (s, c) = pair().await;
+    let a = c.open_channel(pipe::spec("closed", None)).await.unwrap();
+    let b = s.accept_channel().await.unwrap();
+    a.close(code::NORMAL, None).await;
+    b.closed().await;
+    assert!(a.properties().is_none());
+    assert!(Pipe::new(a).is_err());
+}
+
+#[tokio::test]
+async fn pipe_rejects_invalid_requested_properties_even_on_a_reliable_path() {
+    let (s, c) = pair().await;
+    for (reliable, ordered) in [(false, true), (true, false), (false, false)] {
+        let mut spec = pipe::spec("invalid", None);
+        spec.reliable = reliable;
+        spec.ordered = ordered;
+        let a = c.open_channel(spec).await.unwrap();
+        let b = s.accept_channel().await.unwrap();
+        assert!(a.properties().unwrap().reliable && a.properties().unwrap().ordered);
+        assert!(Pipe::new(a).is_err(), "the request itself must meet pipe/1 requirements");
+        assert!(Pipe::new(b).is_err());
+    }
+}
+
+#[tokio::test]
 async fn a_pipe_carries_bytes_with_half_close_and_backpressure() {
     let (s, c) = pair().await;
     let a = Pipe::new(c.open_channel(pipe::spec("p", Some("tcp:localhost:1"))).await.unwrap()).unwrap();
