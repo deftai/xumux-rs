@@ -28,6 +28,104 @@ async fn pair() -> (Session, Session) {
 }
 
 #[tokio::test]
+async fn slow_admission_does_not_block_unrelated_channel_data() {
+    let (a, b) = duplex(1 << 20);
+    let (ar, aw) = split(a);
+    let (br, bw) = split(b);
+    let acceptor = Acceptor::default().policy(|_| Ok(())).defer_profile(pipe::PROFILE);
+    let server = tokio::spawn(Session::accept(ar, aw, Options::default(), acceptor));
+    let (client, _) = Session::connect(br, bw, Options::default(), Acceptor::default(), vec![]).await.unwrap();
+    let server = server.await.unwrap().unwrap();
+    let client_fast = client.open_channel(ChannelSpec::reliable("fast")).await.unwrap();
+    let server_fast = server.accept_channel().await.unwrap();
+    let slow = tokio::spawn({ let client = client.clone(); async move { client.open_channel(pipe::spec("slow", None)).await } });
+    let pending = server.accept_pending_channel().await.unwrap();
+    assert_eq!(pending.spec().name, "slow");
+    assert!(!slow.is_finished(), "no ACK before admission");
+    client_fast.send(1, Bytes::from_static(b"unrelated")).await.unwrap();
+    let received = tokio::time::timeout(Duration::from_millis(100), server_fast.receive()).await;
+    let admitted = pending.accept().unwrap();
+    let opened = slow.await.unwrap().unwrap();
+    opened.send(2, Bytes::from_static(b"admitted")).await.unwrap();
+    assert_eq!(admitted.receive().await.unwrap().unwrap().payload, b"admitted"[..]);
+    assert_eq!(received.expect("slow admission must not stop another channel").unwrap().unwrap().payload, b"unrelated"[..]);
+}
+
+async fn deferred_pair(limit: usize, initial: Vec<ChannelSpec>) -> (Session, Session, Vec<Result<xumux::Channel, Error>>) {
+    let (a, b) = duplex(1 << 20);
+    let (ar, aw) = split(a);
+    let (br, bw) = split(b);
+    let acceptor = Acceptor::default().policy(|_| Ok(())).defer_profile(pipe::PROFILE);
+    let opts = Options { max_channels: limit, ..Options::default() };
+    let server = tokio::spawn(Session::accept(ar, aw, opts, acceptor));
+    let (client, channels) = Session::connect(br, bw, Options::default(), Acceptor::default(), initial).await.unwrap();
+    (server.await.unwrap().unwrap(), client, channels)
+}
+
+#[tokio::test]
+async fn deferred_admission_limits_drop_and_id_reuse() {
+    let (server, client, _) = deferred_pair(1, vec![]).await;
+    let opening = tokio::spawn({ let client = client.clone(); async move { client.open_channel(pipe::spec("one", None)).await } });
+    let pending = server.accept_pending_channel().await.unwrap();
+    let refused = client.open_channel(pipe::spec("two", None)).await;
+    assert!(matches!(refused, Err(Error::Refused(info)) if info.code == code::CHANNEL_LIMIT));
+    drop(pending);
+    assert!(matches!(opening.await.unwrap(), Err(Error::Refused(info)) if info.code == code::CHANNEL_REFUSED));
+    let opening = tokio::spawn({ let client = client.clone(); async move { client.open_channel(pipe::spec("replacement", None)).await } });
+    let pending = server.accept_pending_channel().await.unwrap();
+    let accepted = pending.accept().unwrap();
+    let opened = opening.await.unwrap().unwrap();
+    opened.send(1, Bytes::from_static(b"replacement")).await.unwrap();
+    assert_eq!(accepted.receive().await.unwrap().unwrap().payload, b"replacement"[..]);
+    assert!(tokio::time::timeout(Duration::from_millis(30), server.accept_channel()).await.is_err(), "admission must publish only one handle");
+}
+
+#[tokio::test]
+async fn deferred_admission_does_not_keep_session_alive() {
+    for take_pending in [false, true] {
+        let (server, client, _) = deferred_pair(1, vec![]).await;
+        let mut opening = Box::pin(client.open_channel(pipe::spec("pending", None)));
+        std::future::poll_fn(|cx| {
+            assert!(opening.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        }).await;
+        // The later ping proves the peer processed OPEN even when the application leaves it queued.
+        client.ping().await.unwrap();
+        let pending = if take_pending { Some(server.accept_pending_channel().await.unwrap()) } else { None };
+        drop(server);
+        if let Some(pending) = pending {
+            tokio::time::timeout(Duration::from_secs(1), pending.closed()).await.unwrap();
+            assert!(pending.accept().is_err());
+        }
+        assert!(tokio::time::timeout(Duration::from_secs(1), opening).await.unwrap().is_err());
+    }
+}
+
+#[tokio::test]
+async fn deferred_profiles_are_refused_in_hello_only() {
+    let (server, client, mut initial) = deferred_pair(4, vec![pipe::spec("early", None), ChannelSpec::reliable("control")]).await;
+    assert!(matches!(initial.remove(0), Err(Error::Refused(info)) if info.code == code::UNSUPPORTED));
+    assert!(initial.remove(0).is_ok());
+    assert_eq!(server.accept_channel().await.unwrap().spec().name, "control");
+    let opening = tokio::spawn({ let client = client.clone(); async move { client.open_channel(pipe::spec("later", None)).await } });
+    let pending = server.accept_pending_channel().await.unwrap();
+    assert_eq!(pending.spec().name, "later");
+    let _accepted = pending.accept().unwrap();
+    assert!(opening.await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn cancelling_the_opener_closes_after_deferred_acceptance() {
+    let (server, client, _) = deferred_pair(2, vec![]).await;
+    let opening = tokio::spawn({ let client = client.clone(); async move { client.open_channel(pipe::spec("abandoned", None)).await } });
+    let pending = server.accept_pending_channel().await.unwrap();
+    opening.abort();
+    assert!(matches!(opening.await, Err(error) if error.is_cancelled()));
+    let accepted = pending.accept().unwrap();
+    tokio::time::timeout(Duration::from_secs(1), accepted.closed()).await.unwrap();
+}
+
+#[tokio::test]
 async fn messages_keep_their_type_and_boundaries() {
     let (s, c) = pair().await;
     let tx = c.open_channel(ChannelSpec::reliable("a")).await.unwrap();

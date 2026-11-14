@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
-use crate::core::{ChannelSpec, Core, Options, Role, QUIC_MULTISTREAM};
+use crate::core::{ChannelSpec, Options, Role, QUIC_MULTISTREAM};
 use crate::error::{Error, Result};
 use crate::session::{Acceptor, Channel, DatagramPath, Session};
 
@@ -70,7 +70,7 @@ pub async fn accept(conn: quinn::Connection, mut opts: Options, acceptor: Accept
             let _ = s.reset(0u32.into());
         }
     });
-    let core = Core::new(Role::Server, opts, acceptor.policy, acceptor.authorize, Instant::now())?;
+    let core = acceptor.core(Role::Server, opts, Instant::now())?;
     let session = Session::spawn_quic(core, recv, send, Datagrams(conn.clone()));
     // Before the handshake, so a cancelled one still ends the QUIC connection.
     close_with(&session, conn.clone());
@@ -87,7 +87,7 @@ pub async fn connect(conn: quinn::Connection, mut opts: Options, acceptor: Accep
     }
     let (send, recv) = conn.open_bi().await.map_err(io)?;
     let now = Instant::now();
-    let mut core = Core::new(Role::Client, opts, acceptor.policy, acceptor.authorize, now)?;
+    let mut core = acceptor.core(Role::Client, opts, now)?;
     let opened = core.start_client(&channels, now)?;
     let waits: Vec<_> = opened.iter().map(|(id, sig)| (*id, sig.clone(), core.hello_channel_waiter(*id).expect("just inserted"))).collect();
     let session = Session::spawn_quic(core, recv, send, Datagrams(conn.clone()));

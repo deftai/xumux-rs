@@ -36,6 +36,8 @@ let reply = channel.receive().await?;
 
 A server passes `Acceptor::default().policy(|spec| ...)` to `Session::accept`, then takes channels from `session.accept_channel()`. The policy and `authorize` callbacks run on tokio's blocking pool, outside the session's lock, so a slow one delays only the frames that arrive after the one it is deciding. Keepalive doesn't count that wait against the peer, and keeps sending its PINGs so the peer doesn't count it against this side. A callback that panics refuses: the channel with 4010, the HELLO with 4000.
 
+For profiles that must prepare a local endpoint before ACK, use `Acceptor::defer_profile` and `Session::accept_pending_channel`. [Deferred admission](docs/deferred-admission.md) keeps unrelated channels moving during bounded asynchronous setup.
+
 Handles close what they refer to when dropped:
 
 - When the last clone of a `Channel` is dropped, including one inside a `Pipe`, the channel closes with 1000, as `close(1000, None)` would, but without waiting for the answer. Messages not yet sent are discarded. A `Channel` dropped while it is still opening, for example by cancelling `open_channel`, is closed as soon as the peer accepts it.

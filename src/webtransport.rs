@@ -6,7 +6,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use wtransport::{Connection, VarInt};
 
-use crate::core::{Core, Options, Role, QUIC_MULTISTREAM};
+use crate::core::{Options, Role, QUIC_MULTISTREAM};
 use crate::error::{Error, Result};
 use crate::session::{Acceptor, DatagramPath, Session};
 
@@ -59,7 +59,7 @@ pub async fn accept(conn: Connection, mut opts: Options, acceptor: Acceptor) -> 
             let _ = s.reset(VarInt::from_u32(0));
         }
     });
-    let core = Core::new(Role::Server, opts, acceptor.policy, acceptor.authorize, Instant::now())?;
+    let core = acceptor.core(Role::Server, opts, Instant::now())?;
     let session = Session::spawn_quic(core, recv, send, Datagrams(conn.clone()));
     close_with(&session, conn.clone());
     session.finish_handshake_pub().await.inspect_err(|_| conn.close(VarInt::from_u32(0), b""))?;
@@ -74,7 +74,7 @@ pub async fn connect(conn: Connection, mut opts: Options, acceptor: Acceptor) ->
     }
     let (send, recv) = conn.open_bi().await.map_err(io)?.await.map_err(io)?;
     let now = Instant::now();
-    let mut core = Core::new(Role::Client, opts, acceptor.policy, acceptor.authorize, now)?;
+    let mut core = acceptor.core(Role::Client, opts, now)?;
     core.start_client(&[], now)?;
     let session = Session::spawn_quic(core, recv, send, Datagrams(conn.clone()));
     close_with(&session, conn.clone());
