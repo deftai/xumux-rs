@@ -63,6 +63,27 @@ async fn deferred_pair(limit: usize, initial: Vec<ChannelSpec>) -> (Session, Ses
 }
 
 #[tokio::test]
+async fn a_client_can_defer_reverse_channel_admission_before_ack() {
+    let (a, b) = duplex(1 << 20);
+    let (ar, aw) = split(a);
+    let (br, bw) = split(b);
+    let server = tokio::spawn(Session::accept(ar, aw, Options::default(), Acceptor::default().policy(|_| Ok(()))));
+    let acceptor = Acceptor::default().policy(|_| Ok(())).defer_profile(pipe::PROFILE);
+    let (client, _) = Session::connect(br, bw, Options::default(), acceptor, vec![]).await.unwrap();
+    let server = server.await.unwrap().unwrap();
+    let opening = tokio::spawn({ let server = server.clone(); async move { server.open_channel(pipe::spec("reverse", None)).await } });
+    let pending = client.accept_pending_channel().await.unwrap();
+    assert_eq!(pending.spec().name, "reverse");
+    assert!(!opening.is_finished(), "reverse ACK must wait for the client's endpoint setup");
+    // The server can still send another control probe while its reverse open is waiting.
+    tokio::time::timeout(Duration::from_secs(1), server.ping()).await.unwrap().unwrap();
+    let local = pending.accept().unwrap();
+    let remote = opening.await.unwrap().unwrap();
+    remote.send(1, Bytes::from_static(b"reverse bytes")).await.unwrap();
+    assert_eq!(local.receive().await.unwrap().unwrap().payload, b"reverse bytes"[..]);
+}
+
+#[tokio::test]
 async fn deferred_admission_limits_drop_and_id_reuse() {
     let (server, client, _) = deferred_pair(1, vec![]).await;
     let opening = tokio::spawn({ let client = client.clone(); async move { client.open_channel(pipe::spec("one", None)).await } });
