@@ -2,6 +2,7 @@
 use bytes::Bytes;
 use serde_json::{json, Value};
 use std::sync::Mutex;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::core::ChannelSpec;
 use crate::error::{CloseInfo, Error, Result};
@@ -28,12 +29,16 @@ pub fn spec(name: &str, target: Option<&str>) -> ChannelSpec {
 pub struct Pipe {
     ch: Channel,
     state: Mutex<PipeState>,
+    reader: AsyncMutex<()>,
+    writer: AsyncMutex<()>,
+    drained: Notify,
 }
 
 #[derive(Default)]
 struct PipeState {
     sent_eof: bool,
     recv_eof: bool,
+    pending: usize,
 }
 
 impl Pipe {
@@ -42,30 +47,41 @@ impl Pipe {
             return Err(Error::Invalid("not a pipe/1 channel"));
         }
         ch.set_manual_credit(true);
-        Ok(Pipe { ch, state: Mutex::new(PipeState::default()) })
+        Ok(Pipe {
+            ch,
+            state: Mutex::new(PipeState::default()),
+            reader: AsyncMutex::new(()),
+            writer: AsyncMutex::new(()),
+            drained: Notify::new(),
+        })
     }
 
     pub fn channel(&self) -> &Channel {
         &self.ch
     }
 
-    /// The next bytes, or `None` after the peer's EOF. Call [`Pipe::consumed`] after writing them out.
+    /// The next bytes, or `None` after the peer's EOF and all earlier bytes have been consumed.
+    /// Call [`Pipe::consumed`] after writing them out. Reads and writes are independently serialized.
     pub async fn read(&self) -> Result<Option<Bytes>> {
+        let _reader = self.reader.lock().await;
+        if self.state.lock().unwrap().recv_eof {
+            return self.finish_read().await;
+        }
         let Some(m) = self.ch.receive().await? else {
             return Ok(None);
         };
         match m.ty {
-            DATA => Ok(Some(m.payload)),
+            DATA => {
+                self.state.lock().unwrap().pending += m.payload.len();
+                Ok(Some(m.payload))
+            }
             EOF => {
-                let both = {
-                    let mut s = self.state.lock().unwrap();
-                    s.recv_eof = true;
-                    s.sent_eof
-                };
-                if both {
-                    self.ch.close(code::NORMAL, None).await;
+                if !m.payload.is_empty() {
+                    self.ch.close(code::PROTOCOL_ERROR, Some("nonempty pipe EOF")).await;
+                    return Err(Error::Invalid("nonempty pipe EOF"));
                 }
-                Ok(None)
+                self.state.lock().unwrap().recv_eof = true;
+                self.finish_read().await
             }
             RESET => {
                 let v: Value = serde_json::from_slice(&m.payload).unwrap_or(Value::Null);
@@ -86,14 +102,44 @@ impl Pipe {
         }
     }
 
-    /// Returns credit for bytes written to the local end.
+    // Remember EOF before waiting: cancellation of read must not lose it. Bytes already handed to
+    // the caller remain owned by its local write queue even if the channel closes in the meantime.
+    async fn finish_read(&self) -> Result<Option<Bytes>> {
+        loop {
+            let drained = self.drained.notified();
+            tokio::pin!(drained);
+            drained.as_mut().enable();
+            if self.state.lock().unwrap().pending == 0 {
+                break;
+            }
+            drained.await;
+        }
+        let both = self.state.lock().unwrap().sent_eof;
+        if both {
+            self.ch.close(code::NORMAL, None).await;
+        }
+        Ok(None)
+    }
+
+    /// Returns credit for bytes written to the local end, up to the outstanding bytes read.
     pub fn consumed(&self, n: usize) {
+        let n = {
+            let mut state = self.state.lock().unwrap();
+            let n = n.min(state.pending);
+            state.pending -= n;
+            n
+        };
         self.ch.return_credit(n);
+        self.drained.notify_waiters();
     }
 
     /// Writes all the bytes. DATA is never fragmented: each message is sized to the free credit and
     /// the peer's frame limit (pipe/1, implementation notes).
     pub async fn write(&self, mut data: Bytes) -> Result<()> {
+        let _writer = self.writer.lock().await;
+        if self.state.lock().unwrap().sent_eof {
+            return Err(Error::Invalid("pipe already sent EOF"));
+        }
         let frame_limit = self.ch.max_unfragmented() as u64;
         while !data.is_empty() {
             let credit = self.ch.wait_credit().await?;
@@ -105,12 +151,17 @@ impl Pipe {
 
     /// Half-close: no more data from this side, like TCP FIN.
     pub async fn write_eof(&self) -> Result<()> {
+        let _writer = self.writer.lock().await;
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.sent_eof {
+                return Ok(());
+            }
+            // send queues before awaiting transport completion, so cancellation cannot undo EOF.
+            state.sent_eof = true;
+        }
         self.ch.send(EOF, Bytes::new()).await?;
-        let both = {
-            let mut s = self.state.lock().unwrap();
-            s.sent_eof = true;
-            s.recv_eof
-        };
+        let both = self.state.lock().unwrap().recv_eof;
         if both {
             self.ch.close(code::NORMAL, None).await;
         }
